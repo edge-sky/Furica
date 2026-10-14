@@ -1,0 +1,28 @@
+[package]
+name = "furica-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Headless voice session and ACP task orchestration core"
+license = "MIT"
+
+[dependencies]
+agent-client-protocol = { version = "3.3", features = ["process"] }
+async-trait = "0.1"
+base64 = "0.22"
+futures-util = "0.3"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
