@@ -8,7 +8,7 @@ use super::{VoiceBackend, VoiceSession};
 use crate::{Error, Result, audio::AudioFrame};
 use async_trait::async_trait;
 use serde_json::Value;
-use std::{sync::Arc, time::Duration};
+use std::{pin::Pin, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
@@ -69,19 +69,48 @@ pub trait TextModel: Send + Sync {
     ) -> Result<ModelResponse>;
 }
 
+/// Mono PCM16: one chunk in a `TtsStream`, or the complete buffered result.
 #[derive(Clone, Debug)]
 pub struct SynthesizedAudio {
     pub sample_rate: u32,
     pub samples: Vec<i16>,
 }
 
+/// Ordered audio chunks. `None` means successful completion; consumers must
+/// stop and drop the stream on the first error. A successful synthesis contains
+/// at least one nonempty chunk, all at the configured pipeline sample rate.
+///
+/// Native streaming adapters deliver chunks as they become available. Buffered
+/// providers may yield their complete result as a single chunk. Adapters must
+/// bound any internal buffering and stop owned work when this stream is dropped
+/// or the synthesis cancellation token is cancelled.
+pub type TtsStream =
+    Pin<Box<dyn futures_core::Stream<Item = Result<SynthesizedAudio>> + Send + 'static>>;
+
+/// Complete text input with streaming or buffered mono PCM16 output.
+/// Adapters own format conversion and resampling to the pipeline sample rate.
+/// Both methods must release owned work on cancellation or future drop.
 #[async_trait]
 pub trait Tts: Send + Sync {
-    /// Return mono PCM16 at the configured pipeline sample rate. The adapter
-    /// owns any necessary resampling; the framework does not guess formats.
-    /// Cancellation/future drop must stop owned synthesis work.
-    async fn synthesize(&self, text: String, cancel: CancellationToken)
-    -> Result<SynthesizedAudio>;
+    /// Preferred output contract. Success opens a stream, not a completed
+    /// synthesis. Opening failures use the outer Result; later failures use
+    /// stream items. The cancellation token covers opening and consumption.
+    /// Consumers must validate chunks and bound cumulative audio duration.
+    async fn synthesize_stream(&self, text: String, cancel: CancellationToken)
+    -> Result<TtsStream>;
+
+    /// Return complete audio only after successful synthesis. `max_audio` must
+    /// be nonzero and at most 120 seconds. Implementations must reject invalid
+    /// limits, empty PCM, sample rates outside 8–48 kHz or changing mid-output,
+    /// and duration overflow before appending to their collection buffer.
+    /// Errors and cancellation return no partial audio. Callers own deadlines.
+    /// Both output methods are required; adapters own their synthesis strategy.
+    async fn synthesize(
+        &self,
+        text: String,
+        max_audio: Duration,
+        cancel: CancellationToken,
+    ) -> Result<SynthesizedAudio>;
 }
 
 #[derive(Clone, Debug)]

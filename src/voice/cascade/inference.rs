@@ -99,7 +99,10 @@ pub(super) async fn infer(
             if reply.trim().is_empty() {
                 None
             } else {
-                let audio = backend.tts.synthesize(reply.clone(), cancel).await?;
+                let audio = backend
+                    .tts
+                    .synthesize(reply.clone(), backend.config.max_generated_audio, cancel)
+                    .await?;
                 if audio.sample_rate != backend.config.sample_rate
                     || audio.samples.is_empty()
                     || audio.samples.len() as f64 / f64::from(audio.sample_rate)
