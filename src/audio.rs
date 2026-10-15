@@ -11,6 +11,21 @@ pub struct AudioFrame {
     pub samples: Vec<i16>,
 }
 
+/// VAD boundaries travel with PCM so endpoint markers cannot overtake queued
+/// audio while a backend is connecting or under backpressure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpeechActivity {
+    Started,
+    Continuing,
+    Ended,
+    Silence,
+}
+
+pub(crate) struct BufferedAudio {
+    pub frame: AudioFrame,
+    pub activity: Option<SpeechActivity>,
+}
+
 impl AudioFrame {
     pub fn validate(&self, sample_rate: u32) -> Result<()> {
         if self.sample_rate != sample_rate {
@@ -33,7 +48,7 @@ impl AudioFrame {
 }
 
 pub(crate) struct AudioBuffer {
-    frames: VecDeque<AudioFrame>,
+    frames: VecDeque<BufferedAudio>,
     samples: usize,
     limit: usize,
 }
@@ -51,21 +66,32 @@ impl AudioBuffer {
     /// longer than the configured pre-roll window.
     pub fn push_rolling(&mut self, frame: AudioFrame) {
         self.samples += frame.samples.len();
-        self.frames.push_back(frame);
+        self.frames.push_back(BufferedAudio {
+            frame,
+            activity: None,
+        });
         while self.samples > self.limit || self.frames.len() > 4096 {
             if let Some(frame) = self.frames.pop_front() {
-                self.samples -= frame.samples.len();
+                self.samples -= frame.frame.samples.len();
             }
         }
     }
 
     /// Connecting buffer: fail explicitly instead of losing request beginnings.
     pub fn push(&mut self, frame: AudioFrame) -> Result<()> {
+        self.push_input(frame, None)
+    }
+
+    pub fn push_input(
+        &mut self,
+        frame: AudioFrame,
+        activity: Option<SpeechActivity>,
+    ) -> Result<()> {
         if self.samples + frame.samples.len() > self.limit || self.frames.len() >= 4096 {
             return Err(Error::Busy("voice connection audio buffer"));
         }
         self.samples += frame.samples.len();
-        self.frames.push_back(frame);
+        self.frames.push_back(BufferedAudio { frame, activity });
         Ok(())
     }
 
@@ -73,6 +99,7 @@ impl AudioBuffer {
         let frames = self
             .frames
             .drain(..)
+            .map(|buffered| buffered.frame)
             .filter(|frame| first_sequence.is_some_and(|first| frame.sequence >= first))
             .collect();
         self.samples = 0;
@@ -80,15 +107,22 @@ impl AudioBuffer {
     }
 
     pub fn oldest_sequence(&self) -> Option<u64> {
-        self.frames.front().map(|frame| frame.sequence)
+        self.frames.front().map(|buffered| buffered.frame.sequence)
     }
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }
-    pub fn pop(&mut self) -> Option<AudioFrame> {
+    pub fn pop(&mut self) -> Option<BufferedAudio> {
         let frame = self.frames.pop_front()?;
-        self.samples -= frame.samples.len();
+        self.samples -= frame.frame.samples.len();
         Some(frame)
+    }
+
+    pub fn snapshot(&self) -> Vec<AudioFrame> {
+        self.frames
+            .iter()
+            .map(|buffered| buffered.frame.clone())
+            .collect()
     }
 
     pub fn clear(&mut self) {
@@ -127,7 +161,7 @@ mod tests {
         buffer.push(frame(4)).unwrap();
         buffer.push(frame(5)).unwrap();
         assert!(buffer.push(frame(6)).is_err());
-        assert_eq!(buffer.pop().unwrap().sequence, 4);
-        assert_eq!(buffer.pop().unwrap().sequence, 5);
+        assert_eq!(buffer.pop().unwrap().frame.sequence, 4);
+        assert_eq!(buffer.pop().unwrap().frame.sequence, 5);
     }
 }

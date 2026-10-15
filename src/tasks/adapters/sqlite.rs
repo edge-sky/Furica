@@ -1,12 +1,11 @@
+//! SQLite snapshot operations. Lifecycle and recovery policy belong to tasks.
+
 use std::{path::Path, sync::Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::{
-    Error, Result,
-    task::{TaskRecord, TaskState},
-};
+use crate::{Error, Result, tasks::domain::TaskRecord};
 
 /// Small task snapshots only. Raw audio and API credentials are never persisted.
 /// One TaskManager must own a database at a time; this is not a multi-process queue.
@@ -123,18 +122,5 @@ impl TaskStore {
         )?;
         transaction.commit()?;
         Ok(record)
-    }
-
-    pub(crate) fn recover(&self) -> Result<()> {
-        for record in self.list()? {
-            if !record.state.is_terminal() {
-                self.update(record.id, |record| {
-                    record.state = TaskState::Interrupted;
-                    record.error =
-                        Some("core restarted; execution effects require reconciliation".into());
-                })?;
-            }
-        }
-        Ok(())
     }
 }

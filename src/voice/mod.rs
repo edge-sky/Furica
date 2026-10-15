@@ -3,7 +3,27 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{Error, Result, audio::AudioFrame};
+use crate::{
+    Error, Result,
+    audio::{AudioFrame, SpeechActivity},
+};
+
+pub mod cascade;
+
+/// Both branches share tools, playback, cancellation and task persistence.
+pub enum VoicePipeline {
+    Cascaded(cascade::CascadedBackend),
+    Duplex(std::sync::Arc<dyn VoiceBackend>),
+}
+
+impl VoicePipeline {
+    pub(crate) fn backend(self) -> std::sync::Arc<dyn VoiceBackend> {
+        match self {
+            Self::Cascaded(backend) => std::sync::Arc::new(backend),
+            Self::Duplex(backend) => backend,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlaybackPosition {
@@ -15,6 +35,12 @@ pub struct PlaybackPosition {
 #[derive(Clone, Debug)]
 pub enum VoiceCommand {
     Audio(AudioFrame),
+    /// Authorized PCM with ordered, framework-owned VAD boundaries. Duplex
+    /// adapters may use their own turn detection but must accept this input.
+    InputAudio {
+        frame: AudioFrame,
+        activity: SpeechActivity,
+    },
     Text(String),
     TaskUpdate(Value),
     /// Restore bounded task metadata without requesting an unsolicited response.

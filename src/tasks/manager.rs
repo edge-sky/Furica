@@ -1,3 +1,5 @@
+//! Task use cases: idempotent submission, scheduling, cancellation and recovery.
+
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -5,79 +7,16 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tokio::sync::{Notify, Semaphore, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{Error, Result, store::TaskStore};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskState {
-    Queued,
-    Running,
-    Cancelling,
-    Completed,
-    Failed,
-    Cancelled,
-    Interrupted,
-}
-
-impl TaskState {
-    pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Completed | Self::Failed | Self::Cancelled | Self::Interrupted
-        )
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TaskRecord {
-    pub id: Uuid,
-    pub request_key: String,
-    pub prompt: String,
-    pub workspace: PathBuf,
-    pub state: TaskState,
-    pub session_id: Option<String>,
-    pub summary: String,
-    pub error: Option<String>,
-    pub stop_reason: Option<String>,
-    pub created_at_ms: u64,
-}
-
-#[derive(Clone, Debug)]
-pub enum TaskEvent {
-    Changed(TaskRecord),
-    Progress { task_id: Uuid, update: Value },
-    Error { task_id: Uuid, message: String },
-}
-
-pub enum ExecutionEvent {
-    SessionCreated(String),
-    Update(Value),
-}
-
-pub struct TaskOutcome {
-    pub state: TaskState,
-    pub summary: String,
-    pub stop_reason: String,
-}
-
-/// Implementations must cooperate with cancellation and clean up owned resources
-/// when the execution future is dropped. Cancelled means confirmed termination.
-#[async_trait]
-pub trait TaskExecutor: Send + Sync {
-    async fn execute(
-        &self,
-        task: TaskRecord,
-        cancel: CancellationToken,
-        progress: mpsc::Sender<ExecutionEvent>,
-    ) -> Result<TaskOutcome>;
-}
+use super::{
+    adapters::sqlite::TaskStore,
+    domain::{TaskEvent, TaskOutcome, TaskRecord, TaskState},
+    ports::{ExecutionEvent, TaskExecutor},
+};
+use crate::{Error, Result};
 
 #[derive(Clone, Debug)]
 pub struct TaskLimits {
@@ -130,7 +69,11 @@ impl TaskManager {
         {
             return Err(Error::Config("invalid task limits".into()));
         }
-        store.recover()?;
+        for record in store.list()? {
+            if !record.state.is_terminal() {
+                store.update(record.id, TaskRecord::recover)?;
+            }
+        }
         let (events, _) = broadcast::channel(128);
         Ok(Self(Arc::new(Inner {
             store,
@@ -218,8 +161,7 @@ impl TaskManager {
             let id = task.id;
             if let Err(error) = manager.run(task, cancel).await {
                 let _ = manager.0.store.update(id, |record| {
-                    record.state = TaskState::Interrupted;
-                    record.error = Some(error.to_string());
+                    record.interrupt(error.to_string());
                 });
                 let _ = manager.0.events.send(TaskEvent::Error {
                     task_id: id,
@@ -242,10 +184,7 @@ impl TaskManager {
             .map_err(|_| Error::State("task lock poisoned".into()))?;
         let mut changed = false;
         let record = self.0.store.update(id, |record| {
-            if !record.state.is_terminal() {
-                record.state = TaskState::Cancelling;
-                changed = true;
-            }
+            changed = record.request_cancellation();
         })?;
         if let Some(cancel) = controls.get(&id) {
             cancel.cancel();
@@ -305,11 +244,7 @@ impl TaskManager {
             )?;
             return Ok(());
         }
-        let record = self.0.store.update(task.id, |record| {
-            if record.state == TaskState::Queued {
-                record.state = TaskState::Running;
-            }
-        })?;
+        let record = self.0.store.update(task.id, TaskRecord::mark_running)?;
         let _ = self.0.events.send(TaskEvent::Changed(record));
         let (tx, mut rx) = mpsc::channel(64);
         let future = tokio::time::timeout(
@@ -351,21 +286,7 @@ impl TaskManager {
     }
 
     fn finish(&self, id: Uuid, outcome: Result<TaskOutcome>) -> Result<()> {
-        let record = self.0.store.update(id, |record| match outcome {
-            Ok(outcome) if outcome.state.is_terminal() => {
-                record.state = outcome.state;
-                record.summary = outcome.summary.chars().take(16_384).collect();
-                record.stop_reason = Some(outcome.stop_reason);
-            }
-            Ok(_) => {
-                record.state = TaskState::Interrupted;
-                record.error = Some("executor returned a nonterminal outcome".into());
-            }
-            Err(error) => {
-                record.state = TaskState::Interrupted;
-                record.error = Some(error.to_string());
-            }
-        })?;
+        let record = self.0.store.update(id, |record| record.finish(outcome))?;
         let _ = self.0.events.send(TaskEvent::Changed(record));
         Ok(())
     }

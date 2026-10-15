@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     Error, Result,
-    task::{ExecutionEvent, TaskExecutor, TaskOutcome, TaskRecord, TaskState},
+    tasks::{ExecutionEvent, TaskExecutor, TaskOutcome, TaskRecord, TaskState},
 };
 
 #[async_trait]
