@@ -69,7 +69,7 @@ pub trait TextModel: Send + Sync {
     ) -> Result<ModelResponse>;
 }
 
-/// Mono PCM16: one chunk in a `TtsStream`, or the complete buffered result.
+/// Mono PCM16 audio; a stream chunk or the pipeline's collected result.
 #[derive(Clone, Debug)]
 pub struct SynthesizedAudio {
     pub sample_rate: u32,
@@ -87,30 +87,17 @@ pub struct SynthesizedAudio {
 pub type TtsStream =
     Pin<Box<dyn futures_core::Stream<Item = Result<SynthesizedAudio>> + Send + 'static>>;
 
-/// Complete text input with streaming or buffered mono PCM16 output.
+/// Complete text input with streaming mono PCM16 output.
 /// Adapters own format conversion and resampling to the pipeline sample rate.
-/// Both methods must release owned work on cancellation or future drop.
+/// Implementations must release owned work on cancellation or future/stream drop.
 #[async_trait]
 pub trait Tts: Send + Sync {
-    /// Preferred output contract. Success opens a stream, not a completed
+    /// Success opens a stream, not a completed
     /// synthesis. Opening failures use the outer Result; later failures use
     /// stream items. The cancellation token covers opening and consumption.
     /// Consumers must validate chunks and bound cumulative audio duration.
     async fn synthesize_stream(&self, text: String, cancel: CancellationToken)
     -> Result<TtsStream>;
-
-    /// Return complete audio only after successful synthesis. `max_audio` must
-    /// be nonzero and at most 120 seconds. Implementations must reject invalid
-    /// limits, empty PCM, sample rates outside 8–48 kHz or changing mid-output,
-    /// and duration overflow before appending to their collection buffer.
-    /// Errors and cancellation return no partial audio. Callers own deadlines.
-    /// Both output methods are required; adapters own their synthesis strategy.
-    async fn synthesize(
-        &self,
-        text: String,
-        max_audio: Duration,
-        cancel: CancellationToken,
-    ) -> Result<SynthesizedAudio>;
 }
 
 #[derive(Clone, Debug)]

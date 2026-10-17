@@ -6,9 +6,9 @@ rust-version = "1.88"
 description = "Headless voice session and ACP task orchestration core"
 license = "MIT"
 
-[workspace]
-members = ["crates/furica-vad"]
-resolver = "3"
+[[test]]
+name = "behavior"
+path = "tests/behavior/main.rs"
 
 [dependencies]
 agent-client-protocol = { version = "3.3", features = ["process"] }

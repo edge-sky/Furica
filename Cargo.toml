@@ -1,0 +1,3 @@
+[workspace]
+members = ["furica-core", "furica-vad", "furica-adapters"]
+resolver = "3"

@@ -1,0 +1,35 @@
+[package]
+name = "furica-adapters"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Replaceable speech capability implementations for Furica"
+license = "MIT"
+
+[features]
+default = []
+cloud = ["dep:base64", "dep:bytes", "dep:reqwest", "dep:serde_json", "dep:futures-util"]
+aliyun = ["cloud", "dep:tokio-tungstenite", "dep:uuid"]
+volcengine = ["cloud", "dep:uuid"]
+
+[dependencies]
+furica-core = { path = "../furica-core" }
+async-trait = "0.1"
+futures-core = "0.3"
+tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+base64 = { version = "0.22", optional = true }
+bytes = { version = "1", optional = true }
+futures-util = { version = "0.3", features = ["sink"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"], optional = true }
+serde_json = { version = "1", optional = true }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+
+[dev-dependencies]
+futures-util = { version = "0.3", features = ["sink"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
