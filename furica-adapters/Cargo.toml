@@ -3,12 +3,16 @@ name = "furica-adapters"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Replaceable speech capability implementations for Furica"
+description = "Replaceable speech and text capability implementations for Furica"
 license = "MIT"
 
 [features]
 default = []
-cloud = ["dep:base64", "dep:bytes", "dep:reqwest", "dep:serde_json", "dep:futures-util"]
+http = ["dep:bytes", "dep:reqwest", "dep:serde_json", "dep:futures-util"]
+cloud = ["http", "dep:base64"]
+openai-compatible = ["http"]
+openai-responses = ["http"]
+anthropic = ["http"]
 aliyun = ["cloud", "dep:tokio-tungstenite", "dep:uuid"]
 volcengine = ["cloud", "dep:uuid"]
 

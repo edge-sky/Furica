@@ -1,12 +1,21 @@
 //! Replaceable implementations of Furica's capability contracts.
 //!
-//! Provider modules are opt-in; the default build does not include cloud clients
-//! or the local ONNX engine. Hosts construct adapters and inject them into Core.
+//! Provider modules expose their existing configuration and capability adapters.
+//! Infrastructure details remain private; the host selects and injects adapters.
 #![doc = include_str!("../README.md")]
 
 #[cfg(feature = "aliyun")]
 pub mod aliyun;
-#[cfg(any(feature = "aliyun", feature = "volcengine"))]
-mod cloud;
+#[cfg(feature = "http")]
+mod infrastructure;
+#[cfg(test)]
+mod tests;
 #[cfg(feature = "volcengine")]
 pub mod volcengine;
+
+#[cfg(any(
+    feature = "openai-compatible",
+    feature = "openai-responses",
+    feature = "anthropic"
+))]
+pub mod text_model;

@@ -9,7 +9,7 @@ use crate::{
     audio::{AudioFrame, SpeechActivity},
     orchestration::{VoiceChannels, VoiceCommand, VoiceEvent},
     stt::{self, Utterance},
-    text_model::{ModelMessage, ModelResponse, message_size, validate_text},
+    text_model::{FinishReason, ModelMessage, message_size, validate_text},
 };
 use std::collections::{HashSet, VecDeque};
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -225,38 +225,42 @@ impl CascadeWorker {
                 final_chunk: true,
             })?;
         }
-        match result.response {
-            Some(ModelResponse::Text(text)) => {
-                self.remember(ModelMessage::Assistant(text.clone()))?;
+        if let Some(response) = result.response {
+            let text = response.message.text();
+            let calls = if response.finish_reason == FinishReason::ToolCalls {
+                response.message.tool_calls().cloned().collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if response.finish_reason != FinishReason::Truncated {
+                self.remember(ModelMessage::Assistant(response.message))?;
+            }
+            if !text.is_empty() {
                 self.emit(VoiceEvent::Transcript {
                     user: false,
                     text,
-                    final_chunk: true,
+                    final_chunk: response.finish_reason != FinishReason::Truncated,
                 })?;
-                if let Some(audio) = result.audio {
-                    let item_id = Uuid::new_v4().to_string();
-                    for samples in audio.samples.chunks(audio.sample_rate as usize) {
-                        self.emit(VoiceEvent::Audio {
-                            item_id: item_id.clone(),
-                            content_index: 0,
-                            sample_rate: audio.sample_rate,
-                            samples: samples.to_vec(),
-                        })?;
-                    }
-                }
             }
-            Some(ModelResponse::Tools(calls)) => {
-                self.remember(ModelMessage::AssistantTools(calls.clone()))?;
-                for call in calls {
-                    self.waiting_tools.insert(call.call_id.clone());
-                    self.emit(VoiceEvent::ToolCall {
-                        call_id: call.call_id,
-                        name: call.name,
-                        arguments: call.arguments,
+            for call in calls {
+                self.waiting_tools.insert(call.call_id.clone());
+                self.emit(VoiceEvent::ToolCall {
+                    call_id: call.call_id,
+                    name: call.name,
+                    arguments: call.arguments,
+                })?;
+            }
+            if let Some(audio) = result.audio {
+                let item_id = Uuid::new_v4().to_string();
+                for samples in audio.samples.chunks(audio.sample_rate as usize) {
+                    self.emit(VoiceEvent::Audio {
+                        item_id: item_id.clone(),
+                        content_index: 0,
+                        sample_rate: audio.sample_rate,
+                        samples: samples.to_vec(),
                     })?;
                 }
             }
-            None => (),
         }
         Ok(())
     }

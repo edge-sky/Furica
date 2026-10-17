@@ -1,20 +1,31 @@
 //! Task tool declarations selected by the conversation workflow.
+use crate::text_model::ToolDefinition;
+use serde_json::json;
 
-use serde_json::Value;
-
-pub fn task_tools() -> Vec<Value> {
-    vec![
-        serde_json::json!({"type":"function", "name":"start_task",
-            "description":"Submit a real task to the ACP executor. Returns acceptance, not completion.",
-            "parameters":{"type":"object", "properties":{"prompt":{"type":"string"}},
-                "required":["prompt"], "additionalProperties":false}}),
-        serde_json::json!({"type":"function", "name":"get_task_status",
-            "description":"Read a task's execution status and result.",
-            "parameters":{"type":"object", "properties":{"task_id":{"type":"string"}},
-                "required":["task_id"], "additionalProperties":false}}),
-        serde_json::json!({"type":"function", "name":"cancel_task",
-            "description":"Request cancellation; wait for confirmed status before saying it stopped.",
-            "parameters":{"type":"object", "properties":{"task_id":{"type":"string"}},
-                "required":["task_id"], "additionalProperties":false}}),
+pub fn task_tools() -> Vec<ToolDefinition> {
+    [
+        (
+            "start_task",
+            "Submit a real task to the ACP executor. Returns acceptance, not completion.",
+            "prompt",
+        ),
+        (
+            "get_task_status",
+            "Read a task's execution status and result.",
+            "task_id",
+        ),
+        (
+            "cancel_task",
+            "Request cancellation; wait for confirmed status before saying it stopped.",
+            "task_id",
+        ),
     ]
+    .into_iter()
+    .map(|(name, description, parameter)| ToolDefinition {
+        name: name.into(),
+        description: Some(description.into()),
+        parameters: json!({"type":"object", "properties":{parameter:{"type":"string"}},
+            "required":[parameter], "additionalProperties":false}),
+    })
+    .collect()
 }

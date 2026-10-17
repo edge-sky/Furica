@@ -1,7 +1,6 @@
-//! Shared transport and audio mechanics, without provider event semantics.
+//! Shared speech encoding, PCM conversion and bounded JSON reads.
 #[cfg(feature = "volcengine")]
 use std::pin::Pin;
-use std::{future::Future, time::Duration};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 #[cfg(feature = "volcengine")]
@@ -10,102 +9,14 @@ use furica_core::{Error, Result, stt::Utterance, tts::SynthesizedAudio};
 #[cfg(feature = "volcengine")]
 use futures_core::Stream;
 use futures_util::StreamExt;
-use reqwest::{Client, Response, Url, header::HeaderValue};
+use reqwest::Response;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const MESSAGE_LIMIT: usize = 2 * 1024 * 1024;
 const RESPONSE_LIMIT: usize = 1024 * 1024;
 
-pub(crate) async fn cancellable<T>(
-    cancel: &CancellationToken,
-    future: impl Future<Output = Result<T>>,
-) -> Result<T> {
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => Err(Error::Cancelled),
-        result = future => result,
-    }
-}
-
-pub(crate) fn text(value: &str, name: &str) -> Result<()> {
-    if value.trim().is_empty() || value.len() > 1024 || value.chars().any(char::is_control) {
-        return Err(Error::Config(format!("invalid {name}")));
-    }
-    Ok(())
-}
-
-pub(crate) fn endpoint(value: &str, websocket: bool) -> Result<()> {
-    let url = Url::parse(value).map_err(|_| Error::Config("invalid speech endpoint".into()))?;
-    let secure = if websocket { "wss" } else { "https" };
-    let local_scheme = if websocket { "ws" } else { "http" };
-    let local = is_loopback(&url);
-    if url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-        || !(url.scheme() == secure || (local && url.scheme() == local_scheme))
-    {
-        return Err(Error::Config(
-            "speech endpoint requires TLS (except loopback) and no embedded credentials".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn is_loopback(url: &Url) -> bool {
-    url.host_str().is_some_and(|host| {
-        host == "localhost"
-            || host
-                .trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    })
-}
-
-pub(crate) fn secret(value: &str, bearer: bool) -> Result<HeaderValue> {
-    text(value, "speech credential")?;
-    let mut header = HeaderValue::from_str(&if bearer {
-        format!("Bearer {value}")
-    } else {
-        value.to_owned()
-    })
-    .map_err(|_| Error::Config("invalid speech credential".into()))?;
-    header.set_sensitive(true);
-    Ok(header)
-}
-
-pub(crate) fn client(endpoint: &str) -> Result<Client> {
-    let mut builder = Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none());
-    // Loopback endpoints are local test/proxy services. System proxy settings
-    // must not route them through an unrelated forward proxy.
-    if Url::parse(endpoint).is_ok_and(|url| is_loopback(&url)) {
-        builder = builder.no_proxy();
-    }
-    builder
-        .build()
-        .map_err(|_| Error::Config("cannot create speech HTTP client".into()))
-}
-
-pub(crate) fn transport(error: reqwest::Error) -> Error {
-    if error.is_timeout() {
-        Error::Timeout("speech HTTP request")
-    } else {
-        Error::Protocol("speech HTTP transport failed".into())
-    }
-}
-
-pub(crate) fn status(response: &Response) -> Result<()> {
-    if !response.status().is_success() {
-        return Err(Error::Protocol(format!(
-            "speech HTTP status {}",
-            response.status().as_u16()
-        )));
-    }
-    Ok(())
-}
+use super::http::{cancellable, status, transport};
 
 pub(crate) async fn json_response(response: Response, cancel: &CancellationToken) -> Result<Value> {
     status(&response)?;

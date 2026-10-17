@@ -1,11 +1,9 @@
-//! Text generation capability: domain values, adapter port and application use case.
-
+//! Text generation contracts, validated streaming and complete-result collection.
 mod application;
 mod domain;
 mod ports;
-
-pub use application::generate;
 pub(crate) use application::validate_text;
+pub use application::{generate, generate_stream};
 pub(crate) use domain::message_size;
-pub use domain::{ModelMessage, ModelRequest, ModelResponse, ToolCall};
-pub use ports::TextModel;
+pub use domain::*;
+pub use ports::{ModelRequest, ModelStream, TextModel};

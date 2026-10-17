@@ -24,6 +24,9 @@ pub struct CascadeConfig {
     pub inference_timeout: Duration,
     pub max_history_messages: usize,
     pub max_context_bytes: usize,
+    pub instructions: Option<String>,
+    pub max_output_tokens: u32,
+    pub reasoning: Option<crate::text_model::Reasoning>,
 }
 
 impl Default for CascadeConfig {
@@ -36,6 +39,9 @@ impl Default for CascadeConfig {
             inference_timeout: Duration::from_secs(60),
             max_history_messages: 128,
             max_context_bytes: 256 * 1024,
+            instructions: None,
+            max_output_tokens: 4096,
+            reasoning: None,
         }
     }
 }
@@ -65,6 +71,7 @@ impl CascadedBackend {
             || config.inference_timeout.is_zero()
             || config.max_history_messages == 0
             || config.max_history_messages > 4096
+            || config.max_output_tokens == 0
             || config.max_context_bytes == 0
             || config.max_context_bytes > 4 * 1024 * 1024
         {

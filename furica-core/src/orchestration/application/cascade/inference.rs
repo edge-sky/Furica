@@ -5,7 +5,7 @@ use crate::{
     Result,
     orchestration::task_tools,
     stt::{self, Utterance},
-    text_model::{self, ModelMessage, ModelRequest, ModelResponse},
+    text_model::{self, FinishReason, ModelMessage, ModelRequest, ModelResponse},
     tts::{self, SynthesizedAudio},
 };
 use tokio_util::sync::CancellationToken;
@@ -58,25 +58,34 @@ pub(super) async fn infer(
         ModelRequest {
             messages: history,
             tools: task_tools(),
+            instructions: backend.config.instructions.clone(),
+            max_output_tokens: backend.config.max_output_tokens,
+            reasoning: backend.config.reasoning,
         },
         backend.config.max_history_messages,
         backend.config.max_context_bytes,
         cancel.clone(),
     )
     .await?;
-    let audio = match &response {
-        ModelResponse::Text(reply) if !reply.trim().is_empty() => Some(
+    let reply = response.message.text();
+    let audio = if matches!(
+        response.finish_reason,
+        FinishReason::Complete | FinishReason::Refused
+    ) && !reply.trim().is_empty()
+    {
+        Some(
             tts::synthesize(
                 backend.tts.as_ref(),
-                reply.clone(),
+                reply,
                 backend.config.sample_rate,
                 backend.config.max_generated_audio,
                 backend.config.max_context_bytes,
                 cancel,
             )
             .await?,
-        ),
-        _ => None,
+        )
+    } else {
+        None
     };
     Ok(TurnResult {
         user_text: text,
