@@ -1,7 +1,6 @@
 //! Conversation state and decisions, without channels, timers or provider SDKs.
 
-use super::input::SpeakerDecision;
-use crate::{Error, Result, tasks::TaskEvent};
+use crate::{Error, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoreState {
@@ -11,20 +10,6 @@ pub enum CoreState {
     Active,
     Muted,
     Stopped,
-}
-
-#[derive(Clone, Debug)]
-pub enum CoreEvent {
-    State(CoreState),
-    Transcript {
-        user: bool,
-        text: String,
-        final_chunk: bool,
-    },
-    Task(TaskEvent),
-    ClearPlayback,
-    Speaker(SpeakerDecision),
-    Error(String),
 }
 
 impl CoreState {

@@ -6,14 +6,13 @@
 
 pub mod audio;
 pub mod config;
-pub mod conversation;
 pub mod error;
+pub mod input;
+pub mod orchestration;
+pub mod playback;
+pub mod stt;
 pub mod tasks;
-pub mod voice;
+pub mod text_model;
+pub mod tts;
 
-// Existing host integrations keep their module paths; these are the same types.
-pub use conversation as runtime;
-pub use conversation::input;
 pub use error::{Error, Result};
-pub use tasks as task;
-pub use tasks::adapters::{acp, sqlite as store};

@@ -1,13 +1,15 @@
 //! Command receipt, turn queues, tool continuations and cancellation.
 
 use super::{
-    CascadedBackend, ModelMessage, ModelResponse, Utterance,
-    inference::{TurnInput, TurnResult, infer, message_size, validate_text},
+    CascadedBackend,
+    inference::{TurnInput, TurnResult, infer},
 };
 use crate::{
     Error, Result,
     audio::{AudioFrame, SpeechActivity},
-    voice::{VoiceChannels, VoiceCommand, VoiceEvent},
+    orchestration::{VoiceChannels, VoiceCommand, VoiceEvent},
+    stt::{self, Utterance},
+    text_model::{ModelMessage, ModelResponse, message_size, validate_text},
 };
 use std::collections::{HashSet, VecDeque};
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -159,13 +161,14 @@ impl CascadeWorker {
                     _ => (),
                 }
                 if self.speaking {
-                    self.samples += frame.samples.len();
-                    if self.samples as f64 / f64::from(frame.sample_rate)
-                        > self.backend.config.max_utterance.as_secs_f64()
-                        || self.frames.len() >= 4096
-                    {
-                        return Err(Error::Busy("STT utterance buffer"));
-                    }
+                    let samples = self.samples.saturating_add(frame.samples.len());
+                    stt::validate_buffer(
+                        frame.sample_rate,
+                        samples,
+                        self.frames.len() + 1,
+                        self.backend.config.max_utterance,
+                    )?;
+                    self.samples = samples;
                     self.frames.push(frame);
                 }
                 if activity == SpeechActivity::Ended {

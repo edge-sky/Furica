@@ -2,10 +2,8 @@
 
 use super::Actor;
 use crate::{
-    Error, Result,
-    audio::AudioFrame,
-    conversation::{CoreState, input::VadActivity},
-    voice::VoiceEvent,
+    Error, Result, audio::AudioFrame, input::VadActivity, orchestration::CoreState,
+    orchestration::VoiceEvent,
 };
 use tokio::time::Instant;
 

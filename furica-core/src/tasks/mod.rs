@@ -1,10 +1,10 @@
-//! Background task lifecycle and use cases. Execution and persistence live in adapters.
+//! Task bounded context: domain rules, application use cases, execution port and infrastructure.
 
-pub mod adapters;
+mod application;
 pub mod domain;
-mod manager;
+pub mod infrastructure;
 pub mod ports;
 
+pub use application::{TaskLimits, TaskManager};
 pub use domain::{TaskEvent, TaskOutcome, TaskRecord, TaskState};
-pub use manager::{TaskLimits, TaskManager};
 pub use ports::{ExecutionEvent, TaskExecutor};

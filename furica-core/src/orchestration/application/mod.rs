@@ -1,14 +1,21 @@
-//! Voice conversation API. The runtime coordinates input, playback and background tasks.
+//! Conversation application entry points and asynchronous workflow assembly.
 
-pub mod domain;
-pub mod input;
-pub mod playback;
+mod cascade;
+mod events;
 mod runtime;
+mod tools;
 
-pub use domain::{CoreEvent, CoreState};
-pub use playback::{PlaybackChunk, PlaybackState};
+use super::domain::CoreState;
+pub use cascade::{CascadeConfig, CascadedBackend};
+pub use events::CoreEvent;
+pub use runtime::{VoiceChannels, VoiceSession};
+pub use tools::task_tools;
 
-use crate::{Error, Result, audio::AudioFrame, voice::PlaybackPosition};
+use crate::{
+    Error, Result,
+    audio::AudioFrame,
+    playback::{PlaybackChunk, PlaybackPosition, PlaybackState},
+};
 use std::sync::{Arc, Mutex};
 use tokio::{
     sync::{broadcast, mpsc, oneshot, watch},
@@ -127,3 +134,18 @@ impl CoreHandle {
 }
 
 pub struct Core;
+
+/// Both branches share tools, playback, cancellation and task persistence.
+pub enum VoicePipeline {
+    Cascaded(cascade::CascadedBackend),
+    Duplex(std::sync::Arc<dyn crate::orchestration::VoiceBackend>),
+}
+
+impl VoicePipeline {
+    pub(crate) fn backend(self) -> std::sync::Arc<dyn crate::orchestration::VoiceBackend> {
+        match self {
+            Self::Cascaded(backend) => std::sync::Arc::new(backend),
+            Self::Duplex(backend) => backend,
+        }
+    }
+}

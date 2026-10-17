@@ -3,7 +3,8 @@ use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use furica_core::{
     Error, Result,
-    voice::cascade::{Stt, Tts, TtsStream, Utterance},
+    stt::{Stt, Utterance},
+    tts::{Tts, TtsStream},
 };
 use futures_util::stream;
 use reqwest::{Client, header::HeaderValue};

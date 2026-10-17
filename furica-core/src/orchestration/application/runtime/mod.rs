@@ -2,10 +2,13 @@
 
 mod input;
 mod playback;
+mod session;
 mod startup;
 mod tools;
 
-use super::{Action, CoreEvent, CoreState, PlaybackChunk, PlaybackState};
+pub use session::{VoiceChannels, VoiceSession};
+
+use super::{Action, CoreEvent, CoreState};
 
 use std::{
     collections::{HashSet, VecDeque},
@@ -25,9 +28,10 @@ use crate::{
     Error, Result,
     audio::{AudioBuffer, AudioFrame},
     config::CoreConfig,
-    conversation::input::{InputGate, SpeakerDecision},
+    input::{InputGate, SpeakerDecision},
+    orchestration::{VoiceBackend, VoiceCommand, VoiceEvent},
+    playback::{PlaybackChunk, PlaybackPosition, PlaybackState},
     tasks::{TaskEvent, TaskManager},
-    voice::{PlaybackPosition, VoiceBackend, VoiceCommand, VoiceEvent, VoiceSession},
 };
 
 struct Actor {
@@ -367,11 +371,11 @@ impl Actor {
     }
 
     fn announce_result(&mut self) -> Result<()> {
-        if super::domain::can_announce_result(
+        if crate::orchestration::domain::can_announce_result(
             self.speaking || self.gate.as_ref().is_some_and(|gate| gate.speaking),
             self.responding,
             self.session.is_some(),
-            super::playback::has_finished(
+            crate::playback::has_finished(
                 self.playing.as_ref(),
                 self.received_samples,
                 self.config.sample_rate,

@@ -15,12 +15,10 @@ use crate::{
     Error, Result,
     audio::AudioBuffer,
     config::CoreConfig,
-    conversation::{
-        Core, CoreHandle, CoreOutput, CoreState, PlaybackState,
-        input::{InputGate, SpeechInput},
-    },
+    input::{InputGate, SpeechInput},
+    orchestration::{Core, CoreHandle, CoreOutput, CoreState, VoiceBackend, VoicePipeline},
+    playback::PlaybackState,
     tasks::TaskManager,
-    voice::{VoiceBackend, VoicePipeline},
 };
 
 impl Core {

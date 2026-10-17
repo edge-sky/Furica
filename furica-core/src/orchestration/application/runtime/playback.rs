@@ -2,9 +2,8 @@
 
 use super::Actor;
 use crate::{
-    Error, Result,
-    conversation::{CoreEvent, PlaybackChunk},
-    voice::{PlaybackPosition, VoiceCommand},
+    Error, Result, orchestration::CoreEvent, orchestration::VoiceCommand, playback::PlaybackChunk,
+    playback::PlaybackPosition,
 };
 use tokio::time::Instant;
 

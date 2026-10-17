@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    adapters::sqlite::TaskStore,
     domain::{TaskEvent, TaskOutcome, TaskRecord, TaskState},
+    infrastructure::sqlite::TaskStore,
     ports::{ExecutionEvent, TaskExecutor},
 };
 use crate::{Error, Result};

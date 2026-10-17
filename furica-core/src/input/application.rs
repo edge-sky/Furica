@@ -1,43 +1,8 @@
-//! Provider-independent input policy. Authorization belongs to a conversation,
-//! not to a device, an individual frame, or a permanent identity cache.
+//! Input capability assembly, limits and per-input collection bookkeeping.
 
+use super::{SpeakerVerifier, Vad};
+use crate::{Error, Result, config::CoreConfig};
 use std::{sync::Arc, time::Duration};
-
-use async_trait::async_trait;
-use tokio_util::sync::CancellationToken;
-
-use crate::{Error, Result, audio::AudioFrame, config::CoreConfig};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VadActivity {
-    Speech,
-    Silence,
-}
-
-/// Called on the ingress actor. Implementations must be bounded and nonblocking;
-/// device capture, model loading and blocking inference belong outside this call.
-pub trait Vad: Send + Sync {
-    fn detect(&self, frame: &AudioFrame) -> Result<VadActivity>;
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SpeakerDecision {
-    Accepted { speaker_id: String },
-    Rejected,
-    InsufficientAudio,
-}
-
-/// Owns enrollment/matching policy. Scores and enrollment storage are adapter
-/// concerns; the framework accepts only an explicit identity decision.
-/// Implementations must stop owned work on cancellation or future drop.
-#[async_trait]
-pub trait SpeakerVerifier: Send + Sync {
-    async fn verify(
-        &self,
-        frames: Vec<AudioFrame>,
-        cancel: CancellationToken,
-    ) -> Result<SpeakerDecision>;
-}
 
 #[derive(Clone, Debug)]
 pub struct InputConfig {

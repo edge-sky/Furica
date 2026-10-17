@@ -1,6 +1,11 @@
 //! Host playback contract and actual playback completion calculation.
 
-use crate::voice::PlaybackPosition;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaybackPosition {
+    pub item_id: String,
+    pub content_index: u32,
+    pub played_ms: u32,
+}
 
 #[derive(Clone, Debug)]
 pub struct PlaybackChunk {
@@ -18,7 +23,7 @@ pub struct PlaybackState {
     pub active: bool,
 }
 
-pub(super) fn has_finished(
+pub(crate) fn has_finished(
     position: Option<&PlaybackPosition>,
     received_samples: u64,
     sample_rate: u32,

@@ -6,10 +6,7 @@ use std::{future::Future, time::Duration};
 use base64::{Engine, engine::general_purpose::STANDARD};
 #[cfg(feature = "volcengine")]
 use bytes::Bytes;
-use furica_core::{
-    Error, Result,
-    voice::cascade::{SynthesizedAudio, Utterance},
-};
+use furica_core::{Error, Result, stt::Utterance, tts::SynthesizedAudio};
 #[cfg(feature = "volcengine")]
 use futures_core::Stream;
 use futures_util::StreamExt;
