@@ -31,7 +31,7 @@ use crate::{
     input::{InputGate, SpeakerDecision},
     orchestration::{VoiceBackend, VoiceCommand, VoiceEvent},
     playback::{PlaybackChunk, PlaybackPosition, PlaybackState},
-    tasks::{TaskEvent, TaskManager},
+    tasks::{QuestionState, TaskEvent, TaskManager},
 };
 
 struct Actor {
@@ -66,6 +66,7 @@ struct Actor {
     speaking: bool,
     responding: bool,
     task_results: VecDeque<Value>,
+    task_questions: VecDeque<Value>,
 }
 
 impl Actor {
@@ -92,12 +93,15 @@ impl Actor {
                         self.connection.take();
                         match result {
                             Ok(session) => {
-                                let history: Vec<Value> = self.tasks.recent(8)?.into_iter().map(|task| json!({
-                                    "task_id":task.id,
-                                    "prompt":task.prompt.chars().take(512).collect::<String>(),
-                                    "state":task.state,
-                                    "summary":task.summary.chars().take(512).collect::<String>(),
-                                    "error":task.error.map(|text| text.chars().take(256).collect::<String>()),
+                                let history: Vec<Value> = self.tasks.recent_runs_for_conversation(self.epoch, 8)?.into_iter().map(|run| json!({
+                                    "session_id":run.acp_session_id,
+                                    "run_id":run.id,
+                                    "prompt":truncate(&run.prompt, 512),
+                                    "state":run.state,
+                                    "summary":truncate(&run.summary, 512),
+                                    "error":run.error.as_deref().map(|text| truncate(text, 256)),
+                                    "stop_reason":run.stop_reason,
+                                    "created_at_ms":run.created_at_ms,
                                 })).collect();
                                 if !history.is_empty() {
                                     session.try_send(VoiceCommand::TaskContext(json!(history)))?;
@@ -140,13 +144,7 @@ impl Actor {
                 },
                 event = self.task_events.recv() => match event {
                     Ok(event) => {
-                        // Results remain in SQLite if no voice session is active.
-                        // Do not promote untrusted task output to a system instruction.
-                        if let TaskEvent::Changed(record) = &event
-                            && record.state.is_terminal() && self.session.is_some() {
-                                if self.task_results.len() < 32 { self.task_results.push_back(serde_json::to_value(record)?); }
-                                else { self.emit(CoreEvent::Error("task result announcements full; results remain in storage".into())); }
-                            }
+                        self.route_task_event(&event)?;
                         self.emit(CoreEvent::Task(event));
                         if let Err(error) = self.announce_result() { self.fail(error); }
                     }
@@ -159,7 +157,9 @@ impl Actor {
                         && self.last_activity.elapsed() >= self.gate.as_ref().expect("gated state").input.config.verification_timeout {
                         self.fail(Error::Timeout("speaker audio collection"));
                     }
-                    if *self.state.borrow() == CoreState::Active && self.last_activity.elapsed() >= self.config.idle_timeout {
+                    if *self.state.borrow() == CoreState::Active
+                        && self.last_activity.elapsed() >= self.config.idle_timeout
+                        && !self.tasks.has_pending_questions(self.epoch)? {
                         self.end(CoreState::Standby);
                     }
                 }
@@ -212,6 +212,7 @@ impl Actor {
         if let Some(connection) = self.connection.take() {
             connection.abort();
         }
+        self.tasks.detach_conversation(self.epoch);
         self.session.take();
         self.epoch = Uuid::new_v4();
         self.recent.clear();
@@ -222,6 +223,7 @@ impl Actor {
         self.speaking = false;
         self.responding = false;
         self.task_results.clear();
+        self.task_questions.clear();
         self.clear_playback();
         self.playback.send_modify(|state| state.active = false);
         self.set_state(state);
@@ -370,6 +372,86 @@ impl Actor {
         Ok(())
     }
 
+    fn route_task_event(&mut self, event: &TaskEvent) -> Result<()> {
+        match event {
+            TaskEvent::RunChanged {
+                conversation_id,
+                run,
+            } if *conversation_id == self.epoch && run.state.is_terminal() => {
+                let update = json!({
+                    "kind": "run",
+                    "session_id": run.acp_session_id,
+                    "run_id": run.id,
+                    "state": run.state,
+                    "prompt": truncate(&run.prompt, 512),
+                    "summary": truncate(&run.summary, 512),
+                    "stop_reason": run.stop_reason,
+                    "error": run.error.as_deref().map(|text| truncate(text, 256)),
+                });
+                self.push_task_result(update);
+            }
+            TaskEvent::QuestionAsked {
+                conversation_id,
+                question,
+            } if *conversation_id == self.epoch => {
+                let update = json!({
+                    "kind": "question",
+                    "session_id": question.acp_session_id,
+                    "run_id": question.run_id,
+                    "question_id": question.id,
+                    "question": question,
+                });
+                if self.task_questions.len() < 32 {
+                    self.task_questions.push_back(update);
+                } else {
+                    self.emit(CoreEvent::Error(
+                        "task question announcements full; read status instead".into(),
+                    ));
+                }
+            }
+            TaskEvent::QuestionResolved {
+                conversation_id,
+                run_id,
+                question_id,
+                state,
+            } if *conversation_id == self.epoch && state.is_terminal() => {
+                // Give the model and user a fresh idle window after waiting for
+                // input, including when a host answers an already-announced question.
+                self.last_activity = Instant::now();
+                // If the question never reached the model, drop it instead of
+                // announcing a stale question followed by its resolution.
+                let id = question_id.to_string();
+                let queued = self
+                    .task_questions
+                    .iter()
+                    .any(|value| value["question_id"].as_str() == Some(&id));
+                self.task_questions
+                    .retain(|value| value["question_id"].as_str() != Some(&id));
+                if !queued {
+                    let update = json!({
+                        "kind": "question_resolved",
+                        "run_id": run_id,
+                        "question_id": question_id,
+                        "state": state,
+                    });
+                    self.push_task_result(update);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn push_task_result(&mut self, update: Value) {
+        if self.task_results.len() < 32 {
+            self.task_results.push_back(update);
+        } else {
+            self.emit(CoreEvent::Error(
+                "task result announcements full; results remain in storage".into(),
+            ));
+        }
+    }
+
     fn announce_result(&mut self) -> Result<()> {
         if crate::orchestration::domain::can_announce_result(
             self.speaking || self.gate.as_ref().is_some_and(|gate| gate.speaking),
@@ -380,14 +462,36 @@ impl Actor {
                 self.received_samples,
                 self.config.sample_rate,
             ),
-        ) && let Some(result) = self.task_results.pop_front()
-        {
-            self.send(VoiceCommand::TaskUpdate(result))?;
-            self.responding = true;
-            self.last_activity = Instant::now();
+        ) {
+            // Resolution events can still be behind voice events in the actor's
+            // queues. Recheck the authoritative snapshot before asking the user.
+            let mut question = None;
+            while let Some(update) = self.task_questions.pop_front() {
+                let id = update["question_id"]
+                    .as_str()
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .ok_or_else(|| Error::State("invalid queued task question id".into()))?;
+                let current = self.tasks.question(id)?;
+                if current.conversation_id == self.epoch
+                    && current.state == QuestionState::Pending
+                    && current.expires_at_ms > crate::tasks::domain::now_ms()
+                {
+                    question = Some(update);
+                    break;
+                }
+            }
+            if let Some(result) = question.or_else(|| self.task_results.pop_front()) {
+                self.send(VoiceCommand::TaskUpdate(result))?;
+                self.responding = true;
+                self.last_activity = Instant::now();
+            }
         }
         Ok(())
     }
+}
+
+fn truncate(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
 }
 
 impl Drop for Actor {

@@ -2,6 +2,9 @@
 
 use crate::{input::SpeakerDecision, orchestration::domain::CoreState, tasks::TaskEvent};
 
+// Task payloads are low-frequency; keeping the public variant unboxed keeps the
+// host event shape stable.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum CoreEvent {
     State(CoreState),

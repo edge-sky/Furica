@@ -110,6 +110,7 @@ impl Core {
             speaking: false,
             responding: false,
             task_results: VecDeque::new(),
+            task_questions: VecDeque::new(),
         };
         let runner = tokio::spawn(actor.run());
         Ok((
