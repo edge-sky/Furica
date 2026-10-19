@@ -14,17 +14,18 @@ use std::{
 use agent_client_protocol::schema::{
     ProtocolVersion,
     v1::{
-        AuthenticateRequest, CancelNotification, ClientCapabilities, CloseSessionRequest,
-        ContentBlock, CreateElicitationRequest, CreateElicitationResponse, ElicitationAcceptAction,
-        ElicitationAction, ElicitationCapabilities, ElicitationContentValue,
-        ElicitationFormCapabilities, ElicitationMode, ElicitationScope, InitializeRequest,
-        NewSessionRequest, PermissionOptionKind as AcpPermissionOptionKind, PromptRequest,
-        PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
-        RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
-        SessionUpdate, StopReason, TextContent,
+        AuthMethod, AuthenticateRequest, CancelNotification, ClientCapabilities,
+        CloseSessionRequest, ContentBlock, CreateElicitationRequest, CreateElicitationResponse,
+        ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities,
+        ElicitationContentValue, ElicitationFormCapabilities, ElicitationMode, ElicitationScope,
+        Implementation, InitializeRequest, NewSessionRequest,
+        PermissionOptionKind as AcpPermissionOptionKind, PromptRequest, PromptResponse,
+        RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+        SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, StopReason,
+        TextContent,
     },
 };
-use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ConnectionTo};
+use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ConnectionTo, UntypedMessage};
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -411,8 +412,12 @@ fn interrupted_outcome(summary: String, error: String) -> RunOutcome {
 async fn close_remote_session(
     connection: &ConnectionTo<Agent>,
     session_id: &SessionId,
+    supports_close: bool,
     timeout: Duration,
 ) -> Result<()> {
+    if !supports_close {
+        return Ok(());
+    }
     let request = connection
         .send_request(CloseSessionRequest::new(session_id.clone()))
         .block_task();
@@ -774,13 +779,25 @@ impl TaskExecutor for AcpExecutor {
                 },
                 agent_client_protocol::on_receive_request!(),
             )
+            // The SDK defers unhandled session requests for dynamic session
+            // handlers. This executor installs its handlers up front, so reject
+            // unsupported methods immediately rather than leaving them queued.
+            .on_receive_request(
+                async |request: UntypedMessage, responder, _cx| {
+                    responder.respond_with_error(
+                        agent_client_protocol::Error::method_not_found().data(request.method),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
             .connect_with(transport, async move |connection: ConnectionTo<Agent>| {
                 let capabilities = ClientCapabilities::default().elicitation(
                     ElicitationCapabilities::new()
                         .form(ElicitationFormCapabilities::new()),
                 );
-                let initialize =
-                    InitializeRequest::new(ProtocolVersion::V1).client_capabilities(capabilities);
+                let initialize = InitializeRequest::new(ProtocolVersion::V1)
+                    .client_capabilities(capabilities)
+                    .client_info(Implementation::new("furica-core", env!("CARGO_PKG_VERSION")));
                 let init = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Ok(()),
@@ -796,10 +813,10 @@ impl TaskExecutor for AcpExecutor {
                     ));
                 }
                 if let Some(method) = &config.auth_method {
-                    if !init.auth_methods.iter().any(|m| m.id().to_string() == *method) {
-                        return Err(protocol_error(
-                            "configured auth method was not advertised",
-                        ));
+                    let advertised = init.auth_methods.iter().find(|m| m.id().to_string() == *method)
+                        .ok_or_else(|| protocol_error("configured auth method was not advertised"))?;
+                    if !matches!(advertised, AuthMethod::Agent(_)) {
+                        return Err(protocol_error("configured auth method requires unsupported terminal authentication"));
                     }
                     tokio::select! {
                         biased;
@@ -827,6 +844,7 @@ impl TaskExecutor for AcpExecutor {
                     let _ = close_remote_session(
                         &connection,
                         &remote_session_id,
+                        supports_close,
                         config.cancel_timeout,
                     )
                     .await;
@@ -849,6 +867,7 @@ impl TaskExecutor for AcpExecutor {
                         let _ = close_remote_session(
                             &connection,
                             &remote_session_id,
+                            supports_close,
                             config.cancel_timeout,
                         )
                         .await;
@@ -861,6 +880,7 @@ impl TaskExecutor for AcpExecutor {
                             let _ = close_remote_session(
                                 &connection,
                                 &remote_session_id,
+                                supports_close,
                                 config.cancel_timeout,
                             ).await;
                             return Ok(());
@@ -868,13 +888,12 @@ impl TaskExecutor for AcpExecutor {
                         input = inputs.recv() => input,
                         _ = tokio::time::sleep(config.idle_timeout) => {
                             cancel_all_waiters(&waiters, &question_tx);
-                            if supports_close {
-                                close_remote_session(
-                                    &connection,
-                                    &remote_session_id,
-                                    config.cancel_timeout,
-                                ).await.map_err(|error| protocol_error(error.to_string()))?;
-                            }
+                            close_remote_session(
+                                &connection,
+                                &remote_session_id,
+                                supports_close,
+                                config.cancel_timeout,
+                            ).await.map_err(|error| protocol_error(error.to_string()))?;
                             return Ok(());
                         }
                     };
@@ -978,16 +997,12 @@ impl TaskExecutor for AcpExecutor {
                                 NextAction::Continue => {}
                                 NextAction::Close => {
                                     cancel_all_waiters(&waiters, &question_tx);
-                                    let close = if supports_close {
-                                        close_remote_session(
-                                            &connection,
-                                            &remote_session_id,
-                                            config.cancel_timeout,
-                                        )
-                                        .await
-                                    } else {
-                                        Ok(())
-                                    };
+                                    let close = close_remote_session(
+                                        &connection,
+                                        &remote_session_id,
+                                        supports_close,
+                                        config.cancel_timeout,
+                                    ).await;
                                     return close.map_err(|error| protocol_error(error.to_string()));
                                 }
                                 NextAction::Fail(reason) => {
@@ -1002,28 +1017,22 @@ impl TaskExecutor for AcpExecutor {
                         Some(SessionInput::CancelRun { .. }) => {}
                         Some(SessionInput::Close) => {
                             cancel_all_waiters(&waiters, &question_tx);
-                            let close = if supports_close {
-                                close_remote_session(
-                                    &connection,
-                                    &remote_session_id,
-                                    config.cancel_timeout,
-                                )
-                                .await
-                            } else {
-                                Ok(())
-                            };
+                            let close = close_remote_session(
+                                &connection,
+                                &remote_session_id,
+                                supports_close,
+                                config.cancel_timeout,
+                            ).await;
                             return close.map_err(|error| protocol_error(error.to_string()));
                         }
                         None => {
                             cancel_all_waiters(&waiters, &question_tx);
-                            if supports_close {
-                                let _ = close_remote_session(
-                                    &connection,
-                                    &remote_session_id,
-                                    config.cancel_timeout,
-                                )
-                                .await;
-                            }
+                            let _ = close_remote_session(
+                                &connection,
+                                &remote_session_id,
+                                supports_close,
+                                config.cancel_timeout,
+                            ).await;
                             return Ok(());
                         }
                     }
