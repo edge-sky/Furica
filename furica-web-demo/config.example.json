@@ -1,0 +1,8 @@
+{
+  "stt": { "provider": "", "endpoint": "", "model": "", "api_key_env": "", "resource_id": "" },
+  "text_model": {"protocol": "openai-compatible", "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "model": "qwen-plus", "api_key_env": "DASHSCOPE_API_KEY", "isolation_scope": "aliyun-beijing/furica-test", "max_tokens_field": "max_tokens"},
+  "tts": { "provider": "", "endpoint": "", "model": "", "api_key_env": "", "resource_id": "", "voice": "" },
+  "vad_model_path": "",
+  "acp": { "command": "", "args": [], "auth_method": null, "workspace": "" },
+  "instructions": ""
+}
