@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Furica · 内核测试台</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Furica 首页"><span class="brand-mark">f</span> Furica <span class="brand-divider">/</span><span class="brand-subtitle">内核测试台</span></a>
+    <div class="top-status"><span id="connection-dot" class="dot"></span><span id="connection">连接中</span><span class="local-tag">LOCAL DEMO</span></div>
+  </header>
+  <main>
+    <section class="intro"><div><p class="eyebrow">CONVERSATION WORKBENCH</p><h1>让每一步交互，都清晰可见。</h1><p class="subtitle">语音与文字对话、任务执行、内核事件，在同一处验证。</p></div><button id="reconnect" class="button secondary" type="button" hidden>重新连接</button></section>
+    <div id="notice" class="notice" role="status" hidden></div>
+    <section class="config-card" aria-labelledby="config-title">
+      <div class="config-head"><div><span class="section-number">01</span><h2 id="config-title">连接与配置</h2></div><span id="config-state" class="badge amber">等待配置</span></div>
+      <div class="control-row">
+        <label>交互模式<select id="mode"><option value="voice">语音门控 · 完整链路</option><option value="text">文字会话 · 模型与任务</option></select></label>
+        <label>测试声纹结果<select id="speaker"><option value="accepted">通过 · 测试身份</option><option value="rejected">拒绝</option><option value="insufficient_audio">音频不足</option></select></label>
+        <div class="control-actions"><button id="start" class="button primary" disabled>启动内核 <span aria-hidden="true">↗</span></button><button id="stop" class="button secondary" disabled>停止</button></div>
+      </div>
+      <p class="field-note">声纹使用测试校验器，不验证真实身份。服务配置从宿主 config.json 读取，修改后重启宿主。</p>
+      <details id="config-details" open><summary id="config-summary">检查配置中…</summary><ul id="missing" class="missing-list"></ul></details>
+    </section>
+    <div class="workspace">
+      <section class="conversation card" aria-labelledby="conversation-title">
+        <div class="card-head"><div><span class="section-number">02</span><h2 id="conversation-title">对话</h2></div><span id="state" class="badge">未启动</span></div>
+        <div class="conversation-toolbar"><span id="audio-status"><span class="tiny-dot"></span> 麦克风未开启</span><div><button id="wake" class="text-button" disabled>激活会话</button><button id="mute" class="text-button" disabled>静音</button><button id="end" class="text-button" disabled>结束会话</button></div></div>
+        <div id="messages" class="messages" role="log" aria-label="对话记录" aria-live="polite"><div id="empty-chat" class="empty-state"><div class="empty-icon" aria-hidden="true">⌁</div><h3>从一次对话开始</h3><p>填好服务配置，启动内核。<br>语音模式会依次经过 VAD、测试声纹、识别、模型与合成。</p><div class="pipeline"><span>输入</span><i>→</i><span>模型</span><i>→</i><span>语音 / 任务</span></div></div></div>
+        <form id="composer" class="composer"><label class="sr-only" for="text">输入消息</label><textarea id="text" rows="2" placeholder="输入消息，Enter 发送，Shift + Enter 换行" maxlength="16000" disabled></textarea><div class="composer-footer"><span>对话激活后可发送文字</span><div><button id="interrupt" type="button" class="button secondary small" disabled>打断</button><button id="send" class="button primary small" disabled>发送 ↑</button></div></div></form>
+      </section>
+      <section class="tasks card" aria-labelledby="tasks-title"><div class="card-head"><div><span class="section-number">03</span><h2 id="tasks-title">ACP 任务</h2><span id="task-count" class="count">0</span></div><button id="refresh-tasks" class="text-button" disabled>刷新</button></div><div id="task-list" class="task-list"><div class="empty-state compact"><div class="task-icon" aria-hidden="true">▤</div><h3>任务会在这里展开</h3><p>通过对话让模型创建任务。<br>在这里查看进度、回答问题并控制执行。</p></div></div></section>
+    </div>
+    <section class="events card" aria-labelledby="events-title"><div class="card-head"><div><span class="section-number">04</span><h2 id="events-title">事件日志</h2><span id="event-count" class="count">0</span></div><div class="event-actions"><label class="sr-only" for="event-filter">筛选事件</label><select id="event-filter"><option value="all">全部事件</option><option value="error">错误</option><option value="task">任务</option><option value="state">状态</option></select><button id="clear-events" class="text-button">清空</button></div></div><div id="event-list" class="event-list" role="log" aria-label="内核事件"><p class="log-empty">等待宿主事件…</p></div></section>
+    <footer><span>FURICA / LOCAL WORKBENCH</span><span>PCM16 · MONO · 16 kHz <span class="footer-dot">●</span> 独立宿主</span></footer>
+  </main>
+</body>
+</html>
