@@ -105,7 +105,9 @@ pub(crate) fn check_request(request: &ModelRequest, scope: &str) -> Result<()> {
     for message in &request.messages {
         match message {
             ModelMessage::User(s) => add(s.len())?,
-            ModelMessage::TaskContext(v) | ModelMessage::TaskUpdate(v) => add(value_size(v))?,
+            ModelMessage::ExecutionContext(v) | ModelMessage::ExecutionUpdate(v) => {
+                add(value_size(v))?
+            }
             ModelMessage::ToolResult { call_id, result } => {
                 add(call_id.len())?;
                 add(value_size(result))?;
@@ -141,8 +143,8 @@ pub(crate) fn check_request(request: &ModelRequest, scope: &str) -> Result<()> {
 pub(crate) fn data_message(message: &ModelMessage) -> Option<String> {
     match message {
         ModelMessage::User(s) => Some(s.clone()),
-        ModelMessage::TaskContext(v) => Some(json!({"task_context":v}).to_string()),
-        ModelMessage::TaskUpdate(v) => Some(json!({"task_update":v}).to_string()),
+        ModelMessage::ExecutionContext(v) => Some(json!({"task_context":v}).to_string()),
+        ModelMessage::ExecutionUpdate(v) => Some(json!({"task_update":v}).to_string()),
         _ => None,
     }
 }

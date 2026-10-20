@@ -18,7 +18,7 @@ use crate::{
     input::{InputGate, SpeechInput},
     orchestration::{Core, CoreHandle, CoreOutput, CoreState, VoiceBackend, VoicePipeline},
     playback::PlaybackState,
-    tasks::TaskManager,
+    sessions::SessionManager,
 };
 
 impl Core {
@@ -28,29 +28,40 @@ impl Core {
         config: CoreConfig,
         input: SpeechInput,
         pipeline: VoicePipeline,
-        tasks: TaskManager,
+        sessions: SessionManager,
+        session_id: Uuid,
     ) -> Result<(CoreHandle, CoreOutput)> {
         input.validate(&config)?;
-        Self::build(config, pipeline.backend(), tasks, Some(input))
+        Self::build(
+            config,
+            pipeline.backend(),
+            sessions,
+            session_id,
+            Some(input),
+        )
     }
 
-    /// Must be called inside a Tokio runtime. TaskManager and the database have a
-    /// single owner; frontends may clone the returned handle.
+    /// Must be called inside a Tokio runtime. The host supplies the business session and owns its data lifecycle.
     pub fn start(
         config: CoreConfig,
         backend: Arc<dyn VoiceBackend>,
-        tasks: TaskManager,
+        sessions: SessionManager,
+        session_id: Uuid,
     ) -> Result<(CoreHandle, CoreOutput)> {
-        Self::build(config, backend, tasks, None)
+        Self::build(config, backend, sessions, session_id, None)
     }
 
     fn build(
         config: CoreConfig,
         backend: Arc<dyn VoiceBackend>,
-        tasks: TaskManager,
+        sessions: SessionManager,
+        session_id: Uuid,
         input: Option<SpeechInput>,
     ) -> Result<(CoreHandle, CoreOutput)> {
         config.validate()?;
+        if sessions.session(session_id)?.state != crate::sessions::SessionState::Active {
+            return Err(Error::State("session is archived".into()));
+        }
         tokio::runtime::Handle::try_current()
             .map_err(|_| Error::State("Core::start requires a Tokio runtime".into()))?;
         if backend.sample_rate() != config.sample_rate {
@@ -69,7 +80,7 @@ impl Core {
         let (output_tx, output_rx) = mpsc::channel(config.channel_capacity);
         let (connected_tx, connected_rx) = mpsc::channel(1);
         let (verified_tx, verified_rx) = mpsc::channel(1);
-        let task_events = tasks.subscribe();
+        let execution_events = sessions.subscribe();
         let handle = CoreHandle {
             commands,
             audio,
@@ -83,7 +94,7 @@ impl Core {
             pending: AudioBuffer::new(config.sample_rate, config.connect_buffer),
             config,
             backend,
-            tasks,
+            sessions,
             commands: command_rx,
             audio: audio_rx,
             events,
@@ -96,10 +107,11 @@ impl Core {
             verified_rx,
             gate: input.map(InputGate::new),
             verification: None,
-            task_events,
+            execution_events,
             session: None,
             connection: None,
             epoch: Uuid::new_v4(),
+            session_id,
             last_sequence: None,
             last_activity: Instant::now(),
             playing: None,
@@ -109,8 +121,8 @@ impl Core {
             capture_sequence: handle.capture_sequence.clone(),
             speaking: false,
             responding: false,
-            task_results: VecDeque::new(),
-            task_questions: VecDeque::new(),
+            execution_results: VecDeque::new(),
+            execution_questions: VecDeque::new(),
         };
         let runner = tokio::spawn(actor.run());
         Ok((

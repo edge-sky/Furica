@@ -92,9 +92,27 @@ impl VoiceBackend for CascadedBackend {
         self.config.sample_rate
     }
 
-    async fn connect(&self) -> Result<VoiceSession> {
+    async fn connect(
+        &self,
+        sessions: crate::sessions::SessionManager,
+        session_id: uuid::Uuid,
+    ) -> Result<VoiceSession> {
+        let history = sessions.main_history(session_id)?;
+        crate::text_model::validate_request(
+            &crate::text_model::ModelRequest {
+                messages: history,
+                tools: crate::orchestration::execution_tools(),
+                instructions: self.config.instructions.clone(),
+                max_output_tokens: self.config.max_output_tokens,
+                reasoning: self.config.reasoning,
+            },
+            self.model.continuation_source(),
+            self.config.max_history_messages,
+            self.config.max_context_bytes,
+        )?;
+        sessions.set_instructions(session_id, self.config.instructions.as_deref())?;
         let (session, channels) = VoiceSession::channels(self.config.channel_capacity)?;
-        worker::spawn(self.clone(), channels);
+        worker::spawn(self.clone(), channels, sessions, session_id);
         Ok(session)
     }
 }

@@ -2,8 +2,8 @@
 mod application;
 mod domain;
 mod ports;
-pub(crate) use application::validate_text;
 pub use application::{generate, generate_stream};
-pub(crate) use domain::message_size;
+pub(crate) use application::{validate_request, validate_text};
 pub use domain::*;
+pub(crate) use domain::{json_size, message_size};
 pub use ports::{ModelRequest, ModelStream, TextModel};

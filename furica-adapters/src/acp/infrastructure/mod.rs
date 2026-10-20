@@ -1,12 +1,15 @@
 //! ACP v1 client backed by the official SDK's owned stdio transport.
 //!
 //! One `run_session` invocation owns one agent process and one ACP session. Prompt
-//! rounds are serial, but the same remote session is reused until TaskManager sends
+//! rounds are serial, but the same remote session is reused until SessionManager sends
 //! `Close` or the idle timeout releases it.
+
+use super::config::AcpConfig;
+mod updates;
+use updates::{normalize_tool, normalize_update};
 
 use std::{
     collections::{BTreeMap, HashMap},
-    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -32,12 +35,11 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{
+use furica_core::{
     Error, Result,
-    tasks::{
-        AcpSessionRecord, ExecutionEvent, PermissionOption, PermissionOptionKind, QuestionState,
-        RunOutcome, SessionInput, TaskAnswer, TaskExecutor, TaskQuestionDraft, TaskQuestionKind,
-        TaskRunState,
+    sessions::{
+        AcpSession, Answer, ExecutionEvent, ExecutionInput, Executor, PermissionOption,
+        PermissionOptionKind, QuestionDraft, QuestionKind, QuestionState, RunOutcome, RunState,
     },
 };
 
@@ -47,41 +49,14 @@ const MAX_SUMMARY_SOURCE_CHARS: usize = 4_096;
 const MAX_QUESTION_TEXT_CHARS: usize = 8_192;
 const MAX_QUESTION_OPTIONS: usize = 32;
 
-#[derive(Clone, Debug)]
-pub struct AcpConfig {
-    pub command: PathBuf,
-    pub args: Vec<String>,
-    pub auth_method: Option<String>,
-    pub handshake_timeout: Duration,
-    /// Maximum duration of one prompt round.
-    pub run_timeout: Duration,
-    /// Time allowed for the agent to confirm cancellation or session close.
-    pub cancel_timeout: Duration,
-    /// Idle sessions are released after this period without a round.
-    pub idle_timeout: Duration,
-}
-
-impl AcpConfig {
-    pub fn new(command: impl Into<PathBuf>) -> Self {
-        Self {
-            command: command.into(),
-            args: Vec::new(),
-            auth_method: None,
-            handshake_timeout: Duration::from_secs(15),
-            run_timeout: Duration::from_secs(600),
-            cancel_timeout: Duration::from_secs(5),
-            idle_timeout: Duration::from_secs(1_800),
-        }
-    }
-}
-
 pub struct AcpExecutor {
     config: AcpConfig,
 }
 
 impl AcpExecutor {
     pub fn new(config: AcpConfig) -> Result<Self> {
-        if config.command.as_os_str().is_empty()
+        if config.agent_id.trim().is_empty()
+            || config.command.as_os_str().is_empty()
             || config.handshake_timeout.is_zero()
             || config.run_timeout.is_zero()
             || config.cancel_timeout.is_zero()
@@ -100,7 +75,7 @@ struct ActiveRun {
 
 struct QuestionWaiter {
     run_id: Uuid,
-    sender: oneshot::Sender<TaskAnswer>,
+    sender: oneshot::Sender<Answer>,
 }
 
 type ActiveState = Arc<Mutex<Option<ActiveRun>>>;
@@ -143,7 +118,7 @@ fn map_permission_kind(kind: AcpPermissionOptionKind) -> PermissionOptionKind {
     }
 }
 
-fn permission_draft(request: &RequestPermissionRequest, run_id: Uuid) -> Option<TaskQuestionDraft> {
+fn permission_draft(request: &RequestPermissionRequest, run_id: Uuid) -> Option<QuestionDraft> {
     if request.options.len() > MAX_QUESTION_OPTIONS {
         return None;
     }
@@ -174,10 +149,11 @@ fn permission_draft(request: &RequestPermissionRequest, run_id: Uuid) -> Option<
         .as_ref()
         .and_then(|value| serde_json::to_string(value).ok())
         .map(|value| truncate(&value, MAX_SUMMARY_SOURCE_CHARS));
-    Some(TaskQuestionDraft {
+    Some(QuestionDraft {
+        source_tool_call_id: Some(request.tool_call.tool_call_id.to_string()),
         id: Uuid::new_v4(),
         run_id,
-        kind: TaskQuestionKind::Permission {
+        kind: QuestionKind::Permission {
             title: truncate(&title, MAX_QUESTION_TEXT_CHARS),
             summary,
             options,
@@ -185,10 +161,7 @@ fn permission_draft(request: &RequestPermissionRequest, run_id: Uuid) -> Option<
     })
 }
 
-fn elicitation_draft(
-    request: &CreateElicitationRequest,
-    run_id: Uuid,
-) -> Option<TaskQuestionDraft> {
+fn elicitation_draft(request: &CreateElicitationRequest, run_id: Uuid) -> Option<QuestionDraft> {
     let ElicitationMode::Form(form) = &request.mode else {
         return None;
     };
@@ -202,10 +175,11 @@ fn elicitation_draft(
     if serde_json::to_vec(&schema).ok()?.len() > MAX_UPDATE_BYTES {
         return None;
     }
-    Some(TaskQuestionDraft {
+    Some(QuestionDraft {
+        source_tool_call_id: None,
         id: Uuid::new_v4(),
         run_id,
-        kind: TaskQuestionKind::Elicitation {
+        kind: QuestionKind::Elicitation {
             message: truncate(&request.message, MAX_QUESTION_TEXT_CHARS),
             schema,
         },
@@ -214,10 +188,10 @@ fn elicitation_draft(
 
 fn permission_response(
     request: &RequestPermissionRequest,
-    answer: &TaskAnswer,
+    answer: &Answer,
 ) -> (RequestPermissionOutcome, QuestionState) {
     match answer {
-        TaskAnswer::Submit { content } => {
+        Answer::Submit { content } => {
             let option_id = match content {
                 Value::String(id) => Some(id.as_str()),
                 Value::Object(content) => content.get("option_id").and_then(Value::as_str),
@@ -241,17 +215,17 @@ fn permission_response(
                 QuestionState::Cancelled,
             )
         }
-        TaskAnswer::Decline => (RequestPermissionOutcome::Cancelled, QuestionState::Declined),
-        TaskAnswer::Cancel => (
+        Answer::Decline => (RequestPermissionOutcome::Cancelled, QuestionState::Declined),
+        Answer::Cancel => (
             RequestPermissionOutcome::Cancelled,
             QuestionState::Cancelled,
         ),
     }
 }
 
-fn elicitation_response(answer: &TaskAnswer) -> (CreateElicitationResponse, QuestionState) {
+fn elicitation_response(answer: &Answer) -> (CreateElicitationResponse, QuestionState) {
     match answer {
-        TaskAnswer::Submit { content } => match elicitation_content(content) {
+        Answer::Submit { content } => match elicitation_content(content) {
             Some(content) => {
                 let mut action = ElicitationAcceptAction::new();
                 if let Some(content) = content {
@@ -267,11 +241,11 @@ fn elicitation_response(answer: &TaskAnswer) -> (CreateElicitationResponse, Ques
                 QuestionState::Cancelled,
             ),
         },
-        TaskAnswer::Decline => (
+        Answer::Decline => (
             CreateElicitationResponse::new(ElicitationAction::Decline),
             QuestionState::Declined,
         ),
-        TaskAnswer::Cancel => (
+        Answer::Cancel => (
             CreateElicitationResponse::new(ElicitationAction::Cancel),
             QuestionState::Cancelled,
         ),
@@ -314,7 +288,7 @@ fn elicitation_value(value: &Value) -> Option<ElicitationContentValue> {
 fn deliver_answer(
     waiters: &Waiters,
     question_id: Uuid,
-    answer: TaskAnswer,
+    answer: Answer,
     changes: &QuestionChanges,
 ) -> bool {
     let waiter = waiters
@@ -345,7 +319,7 @@ fn cancel_waiters(waiters: &Waiters, run_id: Uuid, changes: &QuestionChanges) {
         question_changed(changes);
     }
     for waiter in removed {
-        let _ = waiter.sender.send(TaskAnswer::Cancel);
+        let _ = waiter.sender.send(Answer::Cancel);
     }
 }
 
@@ -358,7 +332,7 @@ fn cancel_all_waiters(waiters: &Waiters, changes: &QuestionChanges) {
         question_changed(changes);
     }
     for waiter in removed {
-        let _ = waiter.sender.send(TaskAnswer::Cancel);
+        let _ = waiter.sender.send(Answer::Cancel);
     }
 }
 
@@ -367,25 +341,23 @@ fn response_outcome(response: PromptResponse, summary: String, timed_out: bool) 
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned));
     let (state, error) = match response.stop_reason {
-        StopReason::EndTurn => (TaskRunState::Completed, None),
-        StopReason::Cancelled if timed_out => {
-            (TaskRunState::Failed, Some("run timed out".to_owned()))
-        }
-        StopReason::Cancelled => (TaskRunState::Cancelled, None),
+        StopReason::EndTurn => (RunState::Completed, None),
+        StopReason::Cancelled if timed_out => (RunState::Failed, Some("run timed out".to_owned())),
+        StopReason::Cancelled => (RunState::Cancelled, None),
         StopReason::Refusal => (
-            TaskRunState::Failed,
+            RunState::Failed,
             Some("agent refused to continue".to_owned()),
         ),
         StopReason::MaxTokens => (
-            TaskRunState::Failed,
+            RunState::Failed,
             Some("agent stopped at max_tokens".to_owned()),
         ),
         StopReason::MaxTurnRequests => (
-            TaskRunState::Failed,
+            RunState::Failed,
             Some("agent stopped at max_turn_requests".to_owned()),
         ),
         _ => (
-            TaskRunState::Failed,
+            RunState::Failed,
             Some(format!(
                 "agent stopped: {}",
                 stop_reason.as_deref().unwrap_or("unknown")
@@ -402,7 +374,7 @@ fn response_outcome(response: PromptResponse, summary: String, timed_out: bool) 
 
 fn interrupted_outcome(summary: String, error: String) -> RunOutcome {
     RunOutcome {
-        state: TaskRunState::Interrupted,
+        state: RunState::Interrupted,
         summary,
         stop_reason: None,
         error: Some(error),
@@ -463,7 +435,7 @@ async fn run_prompt(
     session_id: &SessionId,
     run_id: Uuid,
     prompt: String,
-    inputs: &mut mpsc::UnboundedReceiver<SessionInput>,
+    inputs: &mut mpsc::UnboundedReceiver<ExecutionInput>,
     waiters: &Waiters,
     changes: &QuestionChanges,
     question_rx: &mut tokio::sync::watch::Receiver<u64>,
@@ -520,21 +492,21 @@ async fn run_prompt(
                 return Ok(PromptEnd::Timeout(result));
             }
             input = inputs.recv() => match input {
-                Some(SessionInput::Answer { question_id, answer }) => {
+                Some(ExecutionInput::Answer { question_id, answer }) => {
                     deliver_answer(waiters, question_id, answer, changes);
                 }
-                Some(SessionInput::CancelRun { run_id: target }) if target == run_id => {
+                Some(ExecutionInput::CancelRun { run_id: target }) if target == run_id => {
                     send_cancel(connection, session_id, run_id, waiters, changes)?;
                     let result = await_cancel(request.as_mut(), config.cancel_timeout).await;
                     return Ok(PromptEnd::CancelRun(result));
                 }
-                Some(SessionInput::CancelRun { .. }) => {}
-                Some(SessionInput::Close) => {
+                Some(ExecutionInput::CancelRun { .. }) => {}
+                Some(ExecutionInput::Close) => {
                     send_cancel(connection, session_id, run_id, waiters, changes)?;
                     let result = await_cancel(request.as_mut(), config.cancel_timeout).await;
                     return Ok(PromptEnd::Close(result));
                 }
-                Some(SessionInput::Prompt { .. }) => {
+                Some(ExecutionInput::Prompt { .. }) => {
                     return Err(Error::Protocol("prompt submitted while a run is active".into()));
                 }
                 None => return Err(Error::Closed),
@@ -544,11 +516,14 @@ async fn run_prompt(
 }
 
 #[async_trait]
-impl TaskExecutor for AcpExecutor {
+impl Executor for AcpExecutor {
+    fn agent_id(&self) -> &str {
+        &self.config.agent_id
+    }
     async fn run_session(
         &self,
-        session: AcpSessionRecord,
-        mut inputs: mpsc::UnboundedReceiver<SessionInput>,
+        session: AcpSession,
+        mut inputs: mpsc::UnboundedReceiver<ExecutionInput>,
         events: mpsc::Sender<ExecutionEvent>,
         cancel: CancellationToken,
     ) -> Result<()> {
@@ -588,41 +563,22 @@ impl TaskExecutor for AcpExecutor {
                     if expected.as_deref() != Some(&notification.session_id.to_string()) {
                         return Err(protocol_error("update for an unknown session"));
                     }
-                    let (run_id, value) = {
-                        let mut current = notification_active
-                            .lock()
-                            .map_err(|_| protocol_error("active run lock poisoned"))?;
-                        let Some(current) = current.as_mut() else {
-                            return Ok(());
-                        };
-                        if let SessionUpdate::AgentMessageChunk(chunk) = &notification.update
-                            && let ContentBlock::Text(text) = &chunk.content
-                        {
-                            let remaining =
-                                MAX_SUMMARY_CHARS.saturating_sub(current.summary.chars().count());
+                    let value=serde_json::to_value(&notification.update).map_err(|e|protocol_error(e.to_string()))?;
+                    if serde_json::to_vec(&value).map_err(|e|protocol_error(e.to_string()))?.len()>MAX_UPDATE_BYTES {return Err(protocol_error("ACP update exceeds limit"));}
+                    let run_id={
+                        let mut active=notification_active.lock().map_err(|_|protocol_error("active run lock poisoned"))?;
+                        if let Some(current)=active.as_mut()
+                            && let SessionUpdate::AgentMessageChunk(chunk)=&notification.update
+                            && let ContentBlock::Text(text)=&chunk.content {
+                            let remaining=MAX_SUMMARY_CHARS.saturating_sub(current.summary.chars().count());
                             current.summary.extend(text.text.chars().take(remaining));
                         }
-                        if matches!(&notification.update, SessionUpdate::AgentThoughtChunk(_)) {
-                            return Ok(());
-                        }
-                        let value = serde_json::to_value(&notification.update)
-                            .map_err(|error| protocol_error(error.to_string()))?;
-                        if serde_json::to_vec(&value)
-                            .map_err(|error| protocol_error(error.to_string()))?
-                            .len()
-                            > MAX_UPDATE_BYTES
-                        {
-                            return Err(protocol_error("ACP update exceeds limit"));
-                        }
-                        (current.id, value)
+                        active.as_ref().map(|run|run.id)
                     };
-                    notification_events
-                        .send(ExecutionEvent::Update {
-                            run_id,
-                            update: value,
-                        })
-                        .await
-                        .map_err(|_| protocol_error("progress receiver closed"))?;
+                    if let Some(event)=normalize_update(run_id,&value){notification_events.send(event).await.map_err(|_|protocol_error("event receiver closed"))?;}
+                    if let Some(run_id)=run_id {
+                        notification_events.send(ExecutionEvent::Update{run_id,update:value}).await.map_err(|_|protocol_error("progress receiver closed"))?;
+                    }
                     Ok(())
                 },
                 agent_client_protocol::on_receive_notification!(),
@@ -653,6 +609,8 @@ impl TaskExecutor for AcpExecutor {
                             RequestPermissionOutcome::Cancelled,
                         ));
                     };
+                    let tool=serde_json::to_value(&request.tool_call).map_err(|e|protocol_error(e.to_string()))?;
+                    if let Some(event)=normalize_tool(Some(run_id),&tool){permission_events.send(event).await.map_err(|_|protocol_error("event receiver closed"))?;}
                     let question_id = draft.id;
                     let (sender, receiver) = oneshot::channel();
                     if permission_waiters
@@ -680,8 +638,8 @@ impl TaskExecutor for AcpExecutor {
                         ));
                     }
                     let answer = tokio::select! {
-                        answer = receiver => answer.unwrap_or(TaskAnswer::Cancel),
-                        _ = permission_cancel.cancelled() => TaskAnswer::Cancel,
+                        answer = receiver => answer.unwrap_or(Answer::Cancel),
+                        _ = permission_cancel.cancelled() => Answer::Cancel,
                     };
                     if let Ok(mut waiters) = permission_waiters.lock() {
                         waiters.remove(&question_id);
@@ -760,8 +718,8 @@ impl TaskExecutor for AcpExecutor {
                         ));
                     }
                     let answer = tokio::select! {
-                        answer = receiver => answer.unwrap_or(TaskAnswer::Cancel),
-                        _ = elicitation_cancel.cancelled() => TaskAnswer::Cancel,
+                        answer = receiver => answer.unwrap_or(Answer::Cancel),
+                        _ = elicitation_cancel.cancelled() => Answer::Cancel,
                     };
                     if let Ok(mut waiters) = elicitation_waiters.lock() {
                         waiters.remove(&question_id);
@@ -898,7 +856,7 @@ impl TaskExecutor for AcpExecutor {
                         }
                     };
                     match input {
-                        Some(SessionInput::Prompt { run_id, prompt }) => {
+                        Some(ExecutionInput::Prompt { run_id, prompt }) => {
                             *active
                                 .lock()
                                 .map_err(|_| protocol_error("active run lock poisoned"))? =
@@ -1011,11 +969,11 @@ impl TaskExecutor for AcpExecutor {
                                 }
                             }
                         }
-                        Some(SessionInput::Answer { question_id, answer }) => {
+                        Some(ExecutionInput::Answer { question_id, answer }) => {
                             deliver_answer(&waiters, question_id, answer, &question_tx);
                         }
-                        Some(SessionInput::CancelRun { .. }) => {}
-                        Some(SessionInput::Close) => {
+                        Some(ExecutionInput::CancelRun { .. }) => {}
+                        Some(ExecutionInput::Close) => {
                             cancel_all_waiters(&waiters, &question_tx);
                             let close = close_remote_session(
                                 &connection,

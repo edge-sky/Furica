@@ -9,7 +9,7 @@ use super::domain::CoreState;
 pub use cascade::{CascadeConfig, CascadedBackend};
 pub use events::CoreEvent;
 pub use runtime::{VoiceChannels, VoiceSession};
-pub use tools::task_tools;
+pub use tools::execution_tools;
 
 use crate::{
     Error, Result,
@@ -135,7 +135,7 @@ impl CoreHandle {
 
 pub struct Core;
 
-/// Both branches share tools, playback, cancellation and task persistence.
+/// Both branches share tools, playback, cancellation and session data.
 pub enum VoicePipeline {
     Cascaded(cascade::CascadedBackend),
     Duplex(std::sync::Arc<dyn crate::orchestration::VoiceBackend>),

@@ -1,7 +1,7 @@
 //! Translate model tool calls into task use cases and feed results back to voice.
 
 use super::Actor;
-use crate::{Error, Result, tasks::TaskAnswer};
+use crate::{Error, Result, sessions::Answer};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -16,13 +16,13 @@ impl Actor {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Continue {
-            session_id: Uuid,
+            acp_session_id: Uuid,
             prompt: String,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct SessionId {
-            session_id: Uuid,
+            acp_session_id: Uuid,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -40,75 +40,84 @@ impl Actor {
             Cancel,
         }
         match name {
-            "start_task" => {
+            "prepare_run" => {
                 let args: Start = serde_json::from_value(arguments)?;
-                let run = self.tasks.start(self.epoch, call_id, args.prompt)?;
+                let run = self
+                    .sessions
+                    .prepare_start(self.session_id, call_id, args.prompt)?;
                 Ok(json!({
-                    "session_id": run.acp_session_id,
+                    "acp_session_id": run.acp_session_id,
                     "run_id": run.id,
                     "state": run.state,
                     "accepted": true
                 }))
             }
-            "continue_task" => {
+            "prepare_next_run" => {
                 let args: Continue = serde_json::from_value(arguments)?;
-                let run =
-                    self.tasks
-                        .continue_task(self.epoch, call_id, args.session_id, args.prompt)?;
+                let run = self.sessions.prepare_continue(
+                    self.session_id,
+                    call_id,
+                    args.acp_session_id,
+                    args.prompt,
+                )?;
                 Ok(json!({
-                    "session_id": run.acp_session_id,
+                    "acp_session_id": run.acp_session_id,
                     "run_id": run.id,
                     "state": run.state,
                     "accepted": true
                 }))
             }
-            "get_task_status" => {
+            "get_execution_status" => {
                 let args: SessionId = serde_json::from_value(arguments)?;
                 Ok(serde_json::to_value(
-                    self.tasks.status(self.epoch, args.session_id)?,
+                    self.sessions.status(self.session_id, args.acp_session_id)?,
                 )?)
             }
-            "answer_task_question" => {
+            "answer_question" => {
                 let args: AnswerQuestion = serde_json::from_value(arguments)?;
                 let answer = match args.action {
-                    AnswerAction::Submit => TaskAnswer::Submit {
+                    AnswerAction::Submit => Answer::Submit {
                         content: args.content.unwrap_or(Value::Null),
                     },
                     AnswerAction::Decline => {
                         if args.content.is_some() {
                             return Err(Error::Config("content is only valid for submit".into()));
                         }
-                        TaskAnswer::Decline
+                        Answer::Decline
                     }
                     AnswerAction::Cancel => {
                         if args.content.is_some() {
                             return Err(Error::Config("content is only valid for submit".into()));
                         }
-                        TaskAnswer::Cancel
+                        Answer::Cancel
                     }
                 };
-                let question = self.tasks.answer(self.epoch, args.question_id, answer)?;
+                let question = self
+                    .sessions
+                    .answer(self.session_id, args.question_id, answer)?;
                 Ok(json!({
                     "question_id": question.id,
                     "state": question.state,
                     "accepted": true
                 }))
             }
-            "cancel_task_run" => {
+            "cancel_run" => {
                 let args: SessionId = serde_json::from_value(arguments)?;
-                let run = self.tasks.cancel_run(self.epoch, args.session_id)?;
+                let run = self
+                    .sessions
+                    .cancel_run(self.session_id, args.acp_session_id)?;
                 Ok(json!({
-                    "session_id": run.acp_session_id,
+                    "acp_session_id": run.acp_session_id,
                     "run_id": run.id,
                     "state": run.state,
                     "accepted": true
                 }))
             }
-            "close_task" => {
+            "close_acp_session" => {
                 let args: SessionId = serde_json::from_value(arguments)?;
-                let session = self.tasks.close(self.epoch, args.session_id)?;
+                let session = self.sessions.close(self.session_id, args.acp_session_id)?;
                 Ok(json!({
-                    "session_id": session.id,
+                    "acp_session_id": session.id,
                     "state": session.state,
                     "accepted": true
                 }))

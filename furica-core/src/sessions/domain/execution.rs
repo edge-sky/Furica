@@ -1,7 +1,4 @@
-//! Task lifecycle rules: ACP sessions, execution rounds and pending questions.
-//!
-//! The task bounded context stores execution facts and bindings only. Conversation
-//! history remains owned by `orchestration`; a task never copies it.
+//! ACP execution lifecycles and user interactions.
 
 use std::path::PathBuf;
 
@@ -50,19 +47,21 @@ impl AcpSessionState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AcpSessionRecord {
+pub struct AcpSession {
     pub id: Uuid,
-    pub conversation_id: Uuid,
+    pub session_id: Uuid,
     pub remote_session_id: Option<String>,
     pub state: AcpSessionState,
     pub workspace: PathBuf,
+    pub agent_id: String,
+    pub updated_at_ms: u64,
     pub created_at_ms: u64,
     pub last_activity_ms: u64,
     pub error: Option<String>,
 }
 
-impl AcpSessionRecord {
-    pub(super) fn opened(&mut self, remote_session_id: String) -> bool {
+impl AcpSession {
+    pub(crate) fn opened(&mut self, remote_session_id: String) -> bool {
         if self.state != AcpSessionState::Opening {
             return false;
         }
@@ -72,7 +71,7 @@ impl AcpSessionRecord {
         true
     }
 
-    pub(super) fn request_close(&mut self) -> bool {
+    pub(crate) fn request_close(&mut self) -> bool {
         if self.state.is_terminal() {
             return false;
         }
@@ -81,7 +80,7 @@ impl AcpSessionRecord {
         true
     }
 
-    pub(super) fn closed(&mut self) -> bool {
+    pub(crate) fn closed(&mut self) -> bool {
         if self.state == AcpSessionState::Closed {
             return false;
         }
@@ -90,7 +89,7 @@ impl AcpSessionRecord {
         true
     }
 
-    pub(super) fn disconnected(&mut self, error: String) -> bool {
+    pub(crate) fn disconnected(&mut self, error: String) -> bool {
         if self.state.is_terminal() {
             return false;
         }
@@ -100,15 +99,17 @@ impl AcpSessionRecord {
         true
     }
 
-    pub(super) fn touch(&mut self) {
+    pub(crate) fn touch(&mut self) {
         self.last_activity_ms = now_ms();
+        self.updated_at_ms = self.last_activity_ms;
     }
 }
 
 /// Lifecycle of one prompt round. A run belongs to exactly one ACP session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TaskRunState {
+pub enum RunState {
+    Prepared,
     Queued,
     Running,
     Completed,
@@ -117,7 +118,7 @@ pub enum TaskRunState {
     Interrupted,
 }
 
-impl TaskRunState {
+impl RunState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -127,14 +128,16 @@ impl TaskRunState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TaskRun {
+pub struct Run {
     pub id: Uuid,
-    /// Local `AcpSessionRecord::id`; the remote ACP id lives on the session.
+    pub session_id: Uuid,
+    pub input_message_id: Uuid,
+    pub updated_at_ms: u64,
+    /// Local `AcpSession::id`; the remote ACP id lives on the session.
     pub acp_session_id: Uuid,
-    /// Idempotency key derived by TaskManager, not by the model.
+    /// Idempotency key derived by SessionManager, not by the model.
     pub request_key: String,
-    pub prompt: String,
-    pub state: TaskRunState,
+    pub state: RunState,
     pub summary: String,
     pub error: Option<String>,
     pub stop_reason: Option<String>,
@@ -146,23 +149,24 @@ pub struct TaskRun {
 /// Terminal result reported by an executor for one round.
 #[derive(Clone, Debug)]
 pub struct RunOutcome {
-    pub state: TaskRunState,
+    pub state: RunState,
     pub summary: String,
     pub stop_reason: Option<String>,
     pub error: Option<String>,
 }
 
-impl TaskRun {
-    pub(super) fn mark_running(&mut self) -> bool {
-        if self.state != TaskRunState::Queued {
+impl Run {
+    pub(crate) fn mark_running(&mut self) -> bool {
+        if self.state != RunState::Queued {
             return false;
         }
-        self.state = TaskRunState::Running;
+        self.state = RunState::Running;
+        self.updated_at_ms = now_ms();
         self.started_at_ms = Some(now_ms());
         true
     }
 
-    pub(super) fn finish(&mut self, outcome: RunOutcome) -> bool {
+    pub(crate) fn finish(&mut self, outcome: RunOutcome) -> bool {
         if self.state.is_terminal() {
             return false;
         }
@@ -175,27 +179,30 @@ impl TaskRun {
         self.error = outcome
             .error
             .map(|error| truncate(&error, MAX_QUESTION_TEXT_CHARS));
-        self.finished_at_ms = Some(now_ms());
+        self.updated_at_ms = now_ms();
+        self.finished_at_ms = Some(self.updated_at_ms);
         true
     }
 
-    pub(super) fn interrupt(&mut self, error: String) -> bool {
+    pub(crate) fn interrupt(&mut self, error: String) -> bool {
         if self.state.is_terminal() {
             return false;
         }
-        self.state = TaskRunState::Interrupted;
+        self.state = RunState::Interrupted;
         self.error = Some(truncate(&error, MAX_QUESTION_TEXT_CHARS));
-        self.finished_at_ms = Some(now_ms());
+        self.updated_at_ms = now_ms();
+        self.finished_at_ms = Some(self.updated_at_ms);
         true
     }
 
-    pub(super) fn cancel_before_start(&mut self, reason: &str) -> bool {
-        if self.state != TaskRunState::Queued {
+    pub(crate) fn cancel_before_start(&mut self, reason: &str) -> bool {
+        if !matches!(self.state, RunState::Prepared | RunState::Queued) {
             return false;
         }
-        self.state = TaskRunState::Cancelled;
+        self.state = RunState::Cancelled;
         self.stop_reason = Some(reason.to_owned());
-        self.finished_at_ms = Some(now_ms());
+        self.updated_at_ms = now_ms();
+        self.finished_at_ms = Some(self.updated_at_ms);
         true
     }
 }
@@ -238,7 +245,7 @@ pub struct PermissionOption {
 /// stay distinct so the model can answer each in its native shape.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TaskQuestionKind {
+pub enum QuestionKind {
     Permission {
         title: String,
         summary: Option<String>,
@@ -252,13 +259,13 @@ pub enum TaskQuestionKind {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
-pub enum TaskAnswer {
+pub enum Answer {
     Submit { content: Value },
     Decline,
     Cancel,
 }
 
-impl TaskAnswer {
+impl Answer {
     pub fn state(&self) -> QuestionState {
         match self {
             Self::Submit { .. } => QuestionState::Answered,
@@ -281,21 +288,23 @@ impl TaskAnswer {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TaskQuestion {
+pub struct Question {
     pub id: Uuid,
+    pub tool_call_id: Option<Uuid>,
+    pub updated_at_ms: u64,
     pub run_id: Uuid,
-    pub conversation_id: Uuid,
+    pub session_id: Uuid,
     pub acp_session_id: Uuid,
-    pub kind: TaskQuestionKind,
+    pub kind: QuestionKind,
     pub state: QuestionState,
-    pub answer: Option<TaskAnswer>,
+    pub answer: Option<Answer>,
     pub created_at_ms: u64,
     pub expires_at_ms: u64,
     pub resolved_at_ms: Option<u64>,
 }
 
-impl TaskQuestion {
-    pub fn validate_answer(&self, answer: &TaskAnswer) -> Result<()> {
+impl Question {
+    pub fn validate_answer(&self, answer: &Answer) -> Result<()> {
         if self.state != QuestionState::Pending {
             return Err(Error::State(format!(
                 "question is not pending: {:?}",
@@ -306,7 +315,7 @@ impl TaskQuestion {
             return Err(Error::State("question has expired".into()));
         }
         match (&self.kind, answer) {
-            (TaskQuestionKind::Permission { options, .. }, TaskAnswer::Submit { .. }) => {
+            (QuestionKind::Permission { options, .. }, Answer::Submit { .. }) => {
                 let Some(option_id) = answer.permission_option_id() else {
                     return Err(Error::Config(
                         "permission answer must contain an option id".into(),
@@ -316,22 +325,23 @@ impl TaskQuestion {
                     return Err(Error::Config("permission option was not advertised".into()));
                 }
             }
-            (TaskQuestionKind::Elicitation { .. }, TaskAnswer::Submit { content }) => {
+            (QuestionKind::Elicitation { .. }, Answer::Submit { content }) => {
                 validate_elicitation_content(content)?;
             }
-            (TaskQuestionKind::Permission { .. }, TaskAnswer::Decline | TaskAnswer::Cancel) => {}
-            (TaskQuestionKind::Elicitation { .. }, TaskAnswer::Decline | TaskAnswer::Cancel) => {}
+            (QuestionKind::Permission { .. }, Answer::Decline | Answer::Cancel) => {}
+            (QuestionKind::Elicitation { .. }, Answer::Decline | Answer::Cancel) => {}
         }
         Ok(())
     }
 
-    pub(super) fn resolve(&mut self, state: QuestionState, answer: Option<TaskAnswer>) -> bool {
+    pub(crate) fn resolve(&mut self, state: QuestionState, answer: Option<Answer>) -> bool {
         if self.state != QuestionState::Pending {
             return false;
         }
         self.state = state;
         self.answer = answer;
-        self.resolved_at_ms = Some(now_ms());
+        self.updated_at_ms = now_ms();
+        self.resolved_at_ms = Some(self.updated_at_ms);
         true
     }
 }
@@ -374,47 +384,48 @@ fn is_elicitation_value(value: &Value) -> bool {
     }
 }
 
-/// A new question proposed by the executor. TaskManager adds binding and time.
+/// A new question proposed by the executor. SessionManager adds binding and time.
 #[derive(Clone, Debug)]
-pub struct TaskQuestionDraft {
+pub struct QuestionDraft {
     pub id: Uuid,
+    pub source_tool_call_id: Option<String>,
     pub run_id: Uuid,
-    pub kind: TaskQuestionKind,
+    pub kind: QuestionKind,
 }
 
 /// Snapshot returned by `get_task_status`.
 #[derive(Clone, Debug, Serialize)]
-pub struct TaskStatus {
-    pub session: AcpSessionRecord,
-    pub runs: Vec<TaskRun>,
-    pub pending_questions: Vec<TaskQuestion>,
+pub struct AcpStatus {
+    pub session: AcpSession,
+    pub runs: Vec<Run>,
+    pub pending_questions: Vec<Question>,
 }
 
 #[derive(Clone, Debug)]
-pub enum TaskEvent {
-    SessionChanged(AcpSessionRecord),
+pub enum SessionEvent {
+    AcpSessionChanged(AcpSession),
     RunChanged {
-        conversation_id: Uuid,
-        run: TaskRun,
+        session_id: Uuid,
+        run: Run,
     },
     Progress {
-        conversation_id: Uuid,
+        session_id: Uuid,
         run_id: Uuid,
         update: Value,
     },
     QuestionAsked {
-        conversation_id: Uuid,
-        question: TaskQuestion,
+        session_id: Uuid,
+        question: Question,
     },
     QuestionResolved {
-        conversation_id: Uuid,
+        session_id: Uuid,
         run_id: Uuid,
         question_id: Uuid,
         state: QuestionState,
     },
     Error {
-        conversation_id: Option<Uuid>,
         session_id: Option<Uuid>,
+        acp_session_id: Option<Uuid>,
         run_id: Option<Uuid>,
         message: String,
     },
@@ -424,11 +435,13 @@ pub enum TaskEvent {
 mod tests {
     use super::*;
 
-    fn question(kind: TaskQuestionKind) -> TaskQuestion {
-        TaskQuestion {
+    fn question(kind: QuestionKind) -> Question {
+        Question {
             id: Uuid::new_v4(),
+            tool_call_id: None,
+            updated_at_ms: now_ms(),
             run_id: Uuid::new_v4(),
-            conversation_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
             acp_session_id: Uuid::new_v4(),
             kind,
             state: QuestionState::Pending,
@@ -441,7 +454,7 @@ mod tests {
 
     #[test]
     fn permission_answers_must_use_advertised_options() {
-        let question = question(TaskQuestionKind::Permission {
+        let question = question(QuestionKind::Permission {
             title: "Run shell".into(),
             summary: None,
             options: vec![PermissionOption {
@@ -452,37 +465,37 @@ mod tests {
         });
         assert!(
             question
-                .validate_answer(&TaskAnswer::Submit {
+                .validate_answer(&Answer::Submit {
                     content: Value::String("deny".into())
                 })
                 .is_err()
         );
         assert!(
             question
-                .validate_answer(&TaskAnswer::Submit {
+                .validate_answer(&Answer::Submit {
                     content: Value::String("allow".into())
                 })
                 .is_ok()
         );
-        assert!(question.validate_answer(&TaskAnswer::Cancel).is_ok());
+        assert!(question.validate_answer(&Answer::Cancel).is_ok());
     }
 
     #[test]
     fn elicitation_answers_are_flat_objects() {
-        let question = question(TaskQuestionKind::Elicitation {
+        let question = question(QuestionKind::Elicitation {
             message: "Name".into(),
             schema: Value::Null,
         });
         assert!(
             question
-                .validate_answer(&TaskAnswer::Submit {
+                .validate_answer(&Answer::Submit {
                     content: serde_json::json!({"name": "Ada", "tags": ["one"]})
                 })
                 .is_ok()
         );
         assert!(
             question
-                .validate_answer(&TaskAnswer::Submit {
+                .validate_answer(&Answer::Submit {
                     content: serde_json::json!({"nested": {"x": 1}})
                 })
                 .is_err()
@@ -491,12 +504,14 @@ mod tests {
 
     #[test]
     fn runs_ignore_late_terminal_updates() {
-        let mut run = TaskRun {
+        let mut run = Run {
             id: Uuid::new_v4(),
             acp_session_id: Uuid::new_v4(),
             request_key: "key".into(),
-            prompt: "prompt".into(),
-            state: TaskRunState::Running,
+            session_id: Uuid::new_v4(),
+            input_message_id: Uuid::new_v4(),
+            updated_at_ms: now_ms(),
+            state: RunState::Running,
             summary: String::new(),
             error: None,
             stop_reason: None,
@@ -505,12 +520,12 @@ mod tests {
             finished_at_ms: None,
         };
         assert!(run.finish(RunOutcome {
-            state: TaskRunState::Completed,
+            state: RunState::Completed,
             summary: "done".into(),
             stop_reason: Some("end_turn".into()),
             error: None,
         }));
         assert!(!run.interrupt("late".into()));
-        assert_eq!(run.state, TaskRunState::Completed);
+        assert_eq!(run.state, RunState::Completed);
     }
 }

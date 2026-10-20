@@ -31,13 +31,13 @@ use crate::{
     input::{InputGate, SpeakerDecision},
     orchestration::{VoiceBackend, VoiceCommand, VoiceEvent},
     playback::{PlaybackChunk, PlaybackPosition, PlaybackState},
-    tasks::{QuestionState, TaskEvent, TaskManager},
+    sessions::{QuestionState, SessionEvent, SessionManager},
 };
 
 struct Actor {
     config: CoreConfig,
     backend: Arc<dyn VoiceBackend>,
-    tasks: TaskManager,
+    sessions: SessionManager,
     commands: mpsc::Receiver<(Action, oneshot::Sender<Result<()>>)>,
     audio: mpsc::Receiver<AudioFrame>,
     events: broadcast::Sender<CoreEvent>,
@@ -50,12 +50,13 @@ struct Actor {
     verified_rx: mpsc::Receiver<(Uuid, Result<SpeakerDecision>)>,
     gate: Option<InputGate>,
     verification: Option<(JoinHandle<()>, tokio_util::sync::CancellationToken)>,
-    task_events: broadcast::Receiver<TaskEvent>,
+    execution_events: broadcast::Receiver<SessionEvent>,
     recent: AudioBuffer,
     pending: AudioBuffer,
     session: Option<VoiceSession>,
     connection: Option<JoinHandle<()>>,
     epoch: Uuid,
+    session_id: Uuid,
     last_sequence: Option<u64>,
     last_activity: Instant,
     playing: Option<PlaybackPosition>,
@@ -65,8 +66,8 @@ struct Actor {
     capture_sequence: Arc<Mutex<Option<u64>>>,
     speaking: bool,
     responding: bool,
-    task_results: VecDeque<Value>,
-    task_questions: VecDeque<Value>,
+    execution_results: VecDeque<Value>,
+    execution_questions: VecDeque<Value>,
 }
 
 impl Actor {
@@ -80,7 +81,7 @@ impl Actor {
                     let Some((action, response)) = command else { break; };
                     if matches!(action, Action::Shutdown) {
                         self.end(CoreState::Stopped);
-                        let result = self.tasks.shutdown(Duration::from_secs(10)).await;
+                        let result = self.sessions.shutdown(Duration::from_secs(10)).await;
                         let failed = result.is_err();
                         let _ = response.send(result);
                         return if failed { Err(Error::Timeout("core task shutdown")) } else { Ok(()) };
@@ -93,18 +94,18 @@ impl Actor {
                         self.connection.take();
                         match result {
                             Ok(session) => {
-                                let history: Vec<Value> = self.tasks.recent_runs_for_conversation(self.epoch, 8)?.into_iter().map(|run| json!({
-                                    "session_id":run.acp_session_id,
+                                let history: Vec<Value> = self.sessions.recent_runs_for_session(self.session_id, 8)?.into_iter().map(|run| -> Result<Value> { Ok(json!({
+                                    "acp_session_id":run.acp_session_id,
                                     "run_id":run.id,
-                                    "prompt":truncate(&run.prompt, 512),
+                                    "prompt":truncate(&self.sessions.run_prompt(run.id)?, 512),
                                     "state":run.state,
                                     "summary":truncate(&run.summary, 512),
                                     "error":run.error.as_deref().map(|text| truncate(text, 256)),
                                     "stop_reason":run.stop_reason,
                                     "created_at_ms":run.created_at_ms,
-                                })).collect();
+                                })) }).collect::<Result<Vec<_>>>()?;
                                 if !history.is_empty() {
-                                    session.try_send(VoiceCommand::TaskContext(json!(history)))?;
+                                    session.try_send(VoiceCommand::ExecutionContext(json!(history)))?;
                                 }
                                 self.session = Some(session);
                                 self.last_activity = Instant::now();
@@ -142,10 +143,10 @@ impl Actor {
                     Some(event) => if let Err(error) = self.voice_event(event) { self.fail(error); },
                     None => self.fail(Error::Closed),
                 },
-                event = self.task_events.recv() => match event {
+                event = self.execution_events.recv() => match event {
                     Ok(event) => {
-                        self.route_task_event(&event)?;
-                        self.emit(CoreEvent::Task(event));
+                        self.route_execution_event(&event)?;
+                        self.emit(CoreEvent::Execution(event));
                         if let Err(error) = self.announce_result() { self.fail(error); }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => self.emit(CoreEvent::Error("task events lagged; reload task snapshots".into())),
@@ -159,7 +160,7 @@ impl Actor {
                     }
                     if *self.state.borrow() == CoreState::Active
                         && self.last_activity.elapsed() >= self.config.idle_timeout
-                        && !self.tasks.has_pending_questions(self.epoch)? {
+                        && !self.sessions.has_pending_questions(self.session_id)? {
                         self.end(CoreState::Standby);
                     }
                 }
@@ -181,7 +182,7 @@ impl Actor {
             }
         }
         self.end(CoreState::Stopped);
-        self.tasks.shutdown(Duration::from_secs(10)).await
+        self.sessions.shutdown(Duration::from_secs(10)).await
     }
 
     fn emit(&self, event: CoreEvent) {
@@ -212,7 +213,6 @@ impl Actor {
         if let Some(connection) = self.connection.take() {
             connection.abort();
         }
-        self.tasks.detach_conversation(self.epoch);
         self.session.take();
         self.epoch = Uuid::new_v4();
         self.recent.clear();
@@ -222,8 +222,8 @@ impl Actor {
         self.discarded_items.clear();
         self.speaking = false;
         self.responding = false;
-        self.task_results.clear();
-        self.task_questions.clear();
+        self.execution_results.clear();
+        self.execution_questions.clear();
         self.clear_playback();
         self.playback.send_modify(|state| state.active = false);
         self.set_state(state);
@@ -263,6 +263,7 @@ impl Actor {
                 self.open_backend();
             }
             Action::EndConversation => {
+                self.sessions.cancel_pending_questions(self.session_id);
                 let state = self.state.borrow().after_end();
                 self.end(state);
             }
@@ -303,8 +304,10 @@ impl Actor {
         let tx = self.connected_tx.clone();
         let timeout = self.config.connect_timeout;
         let epoch = self.epoch;
+        let sessions = self.sessions.clone();
+        let session_id = self.session_id;
         self.connection = Some(tokio::spawn(async move {
-            let result = tokio::time::timeout(timeout, backend.connect())
+            let result = tokio::time::timeout(timeout, backend.connect(sessions, session_id))
                 .await
                 .unwrap_or(Err(Error::Timeout("voice connection")));
             let _ = tx.send((epoch, result)).await;
@@ -372,49 +375,48 @@ impl Actor {
         Ok(())
     }
 
-    fn route_task_event(&mut self, event: &TaskEvent) -> Result<()> {
+    fn route_execution_event(&mut self, event: &SessionEvent) -> Result<()> {
         match event {
-            TaskEvent::RunChanged {
-                conversation_id,
-                run,
-            } if *conversation_id == self.epoch && run.state.is_terminal() => {
+            SessionEvent::RunChanged { session_id, run }
+                if *session_id == self.session_id && run.state.is_terminal() =>
+            {
                 let update = json!({
                     "kind": "run",
-                    "session_id": run.acp_session_id,
+                    "acp_session_id": run.acp_session_id,
                     "run_id": run.id,
                     "state": run.state,
-                    "prompt": truncate(&run.prompt, 512),
+                    "prompt": truncate(&self.sessions.run_prompt(run.id)?, 512),
                     "summary": truncate(&run.summary, 512),
                     "stop_reason": run.stop_reason,
                     "error": run.error.as_deref().map(|text| truncate(text, 256)),
                 });
-                self.push_task_result(update);
+                self.push_execution_result(update);
             }
-            TaskEvent::QuestionAsked {
-                conversation_id,
+            SessionEvent::QuestionAsked {
+                session_id,
                 question,
-            } if *conversation_id == self.epoch => {
+            } if *session_id == self.session_id => {
                 let update = json!({
                     "kind": "question",
-                    "session_id": question.acp_session_id,
+                    "acp_session_id": question.acp_session_id,
                     "run_id": question.run_id,
                     "question_id": question.id,
                     "question": question,
                 });
-                if self.task_questions.len() < 32 {
-                    self.task_questions.push_back(update);
+                if self.execution_questions.len() < 32 {
+                    self.execution_questions.push_back(update);
                 } else {
                     self.emit(CoreEvent::Error(
                         "task question announcements full; read status instead".into(),
                     ));
                 }
             }
-            TaskEvent::QuestionResolved {
-                conversation_id,
+            SessionEvent::QuestionResolved {
+                session_id,
                 run_id,
                 question_id,
                 state,
-            } if *conversation_id == self.epoch && state.is_terminal() => {
+            } if *session_id == self.session_id && state.is_terminal() => {
                 // Give the model and user a fresh idle window after waiting for
                 // input, including when a host answers an already-announced question.
                 self.last_activity = Instant::now();
@@ -422,10 +424,10 @@ impl Actor {
                 // announcing a stale question followed by its resolution.
                 let id = question_id.to_string();
                 let queued = self
-                    .task_questions
+                    .execution_questions
                     .iter()
                     .any(|value| value["question_id"].as_str() == Some(&id));
-                self.task_questions
+                self.execution_questions
                     .retain(|value| value["question_id"].as_str() != Some(&id));
                 if !queued {
                     let update = json!({
@@ -434,7 +436,7 @@ impl Actor {
                         "question_id": question_id,
                         "state": state,
                     });
-                    self.push_task_result(update);
+                    self.push_execution_result(update);
                 }
             }
             _ => {}
@@ -442,12 +444,12 @@ impl Actor {
         Ok(())
     }
 
-    fn push_task_result(&mut self, update: Value) {
-        if self.task_results.len() < 32 {
-            self.task_results.push_back(update);
+    fn push_execution_result(&mut self, update: Value) {
+        if self.execution_results.len() < 32 {
+            self.execution_results.push_back(update);
         } else {
             self.emit(CoreEvent::Error(
-                "task result announcements full; results remain in storage".into(),
+                "task result announcements full; results remain in session data".into(),
             ));
         }
     }
@@ -466,22 +468,22 @@ impl Actor {
             // Resolution events can still be behind voice events in the actor's
             // queues. Recheck the authoritative snapshot before asking the user.
             let mut question = None;
-            while let Some(update) = self.task_questions.pop_front() {
+            while let Some(update) = self.execution_questions.pop_front() {
                 let id = update["question_id"]
                     .as_str()
                     .and_then(|id| Uuid::parse_str(id).ok())
                     .ok_or_else(|| Error::State("invalid queued task question id".into()))?;
-                let current = self.tasks.question(id)?;
-                if current.conversation_id == self.epoch
+                let current = self.sessions.question(id)?;
+                if current.session_id == self.session_id
                     && current.state == QuestionState::Pending
-                    && current.expires_at_ms > crate::tasks::domain::now_ms()
+                    && current.expires_at_ms > crate::sessions::domain::now_ms()
                 {
                     question = Some(update);
                     break;
                 }
             }
-            if let Some(result) = question.or_else(|| self.task_results.pop_front()) {
-                self.send(VoiceCommand::TaskUpdate(result))?;
+            if let Some(result) = question.or_else(|| self.execution_results.pop_front()) {
+                self.send(VoiceCommand::ExecutionUpdate(result))?;
                 self.responding = true;
                 self.last_activity = Instant::now();
             }
@@ -503,6 +505,6 @@ impl Drop for Actor {
         if let Some(connection) = self.connection.take() {
             connection.abort();
         }
-        self.tasks.request_shutdown();
+        self.sessions.request_shutdown();
     }
 }

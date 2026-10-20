@@ -1,21 +1,22 @@
 //! Provider-independent values. Continuations are opaque data, never instructions.
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: Option<String>,
     pub parameters: Value,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub call_id: String,
     pub name: String,
     pub arguments: Value,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelContinuation {
     /// Stable, credential-free identity of protocol, service, model and isolation scope.
     pub source: String,
@@ -31,14 +32,14 @@ impl std::fmt::Debug for ModelContinuation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ModelContent {
     Text(String),
     ToolCall(ToolCall),
     ReasoningSummary(String),
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AssistantMessage {
     pub content: Vec<ModelContent>,
     pub continuation: Option<ModelContinuation>,
@@ -63,7 +64,7 @@ impl AssistantMessage {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ModelMessage {
     User(String),
     Assistant(AssistantMessage),
@@ -72,8 +73,8 @@ pub enum ModelMessage {
         result: Value,
     },
     /// Metadata and agent output are data, never system instructions.
-    TaskContext(Value),
-    TaskUpdate(Value),
+    ExecutionContext(Value),
+    ExecutionUpdate(Value),
 }
 
 /// Effort is a qualitative hint; a token budget is a different, explicit setting.
@@ -188,6 +189,6 @@ pub(crate) fn message_size(message: &ModelMessage) -> usize {
         ModelMessage::ToolResult { call_id, result } => {
             call_id.len().saturating_add(json_size(result))
         }
-        ModelMessage::TaskContext(v) | ModelMessage::TaskUpdate(v) => json_size(v),
+        ModelMessage::ExecutionContext(v) | ModelMessage::ExecutionUpdate(v) => json_size(v),
     }
 }

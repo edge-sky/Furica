@@ -12,14 +12,12 @@ pub enum Error {
     Timeout(&'static str),
     #[error("operation cancelled")]
     Cancelled,
-    #[error("task not found: {0}")]
-    TaskNotFound(String),
+    #[error("record not found: {0}")]
+    NotFound(String),
     #[error("resource limit reached: {0}")]
     Busy(&'static str),
     #[error("invalid state: {0}")]
     State(String),
-    #[error("storage error: {0}")]
-    Storage(#[from] rusqlite::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("I/O error: {0}")]

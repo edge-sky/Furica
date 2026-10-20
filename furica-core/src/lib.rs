@@ -10,8 +10,8 @@ pub mod error;
 pub mod input;
 pub mod orchestration;
 pub mod playback;
+pub mod sessions;
 pub mod stt;
-pub mod tasks;
 pub mod text_model;
 pub mod tts;
 

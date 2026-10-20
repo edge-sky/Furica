@@ -7,6 +7,7 @@ description = "Replaceable speech and text capability implementations for Furica
 license = "MIT"
 
 [features]
+acp = ["dep:agent-client-protocol", "dep:serde_json", "dep:uuid", "tokio/process", "tokio/io-util"]
 default = []
 http = ["dep:bytes", "dep:reqwest", "dep:serde_json", "dep:futures-util"]
 cloud = ["http", "dep:base64"]
@@ -17,6 +18,7 @@ aliyun = ["cloud", "dep:tokio-tungstenite", "dep:uuid"]
 volcengine = ["cloud", "dep:uuid"]
 
 [dependencies]
+agent-client-protocol = { version = "3.3", features = ["process"], optional = true }
 furica-core = { path = "../furica-core" }
 async-trait = "0.1"
 futures-core = "0.3"
@@ -31,6 +33,7 @@ tokio-tungstenite = { version = "0.28", default-features = false, features = ["c
 uuid = { version = "1", features = ["v4"], optional = true }
 
 [dev-dependencies]
+tempfile = "3"
 futures-util = { version = "0.3", features = ["sink"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util"] }
