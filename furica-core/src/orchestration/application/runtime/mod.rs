@@ -4,7 +4,7 @@ mod input;
 mod playback;
 mod session;
 mod startup;
-mod tools;
+use super::tools::CoreTools;
 
 pub use session::{VoiceChannels, VoiceSession};
 
@@ -38,6 +38,7 @@ struct Actor {
     config: CoreConfig,
     backend: Arc<dyn VoiceBackend>,
     sessions: SessionManager,
+    tools: CoreTools,
     commands: mpsc::Receiver<(Action, oneshot::Sender<Result<()>>)>,
     audio: mpsc::Receiver<AudioFrame>,
     events: broadcast::Sender<CoreEvent>,
@@ -357,10 +358,17 @@ impl Actor {
                 if call_id.is_empty() || call_id.len() > 256 {
                     return Err(Error::Protocol("invalid tool call ID".into()));
                 }
-                let result = self.tool(&call_id, &name, arguments);
-                let result = match result {
-                    Ok(result) => result,
-                    Err(error) => json!({"error":error.to_string()}),
+                let crate::text_model::ModelMessage::ToolResult { call_id, result } =
+                    self.tools.invoke(
+                        crate::text_model::ToolCall {
+                            call_id,
+                            name,
+                            arguments,
+                        },
+                        None,
+                    )
+                else {
+                    unreachable!("tool invocation returns a result")
                 };
                 self.send(VoiceCommand::ToolResult { call_id, result })?;
                 self.responding = true;

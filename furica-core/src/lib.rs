@@ -16,3 +16,11 @@ pub mod text_model;
 pub mod tts;
 
 pub use error::{Error, Result};
+
+// Internal ACP command tests live inside the crate so these commands do not
+// become host APIs merely to support behavioral coverage.
+#[cfg(test)]
+extern crate self as furica_core;
+#[cfg(test)]
+#[path = "../tests/behavior/mod.rs"]
+mod behavior;

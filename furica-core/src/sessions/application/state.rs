@@ -96,6 +96,59 @@ impl Memory {
     pub fn snapshot(&self) -> Result<SessionData> {
         Ok(self.lock()?.clone())
     }
+    pub fn saved_prepared_runs(&self, saved: &SessionData) -> Result<Vec<Run>> {
+        saved.validate()?;
+        let data = self.lock()?;
+        let saved_runs: std::collections::HashMap<_, _> = saved
+            .runs
+            .iter()
+            .filter(|run| run.state == RunState::Prepared)
+            .map(|run| (run.id, run))
+            .collect();
+        for id in saved_runs.keys() {
+            if !data.runs.iter().any(|run| run.id == *id) {
+                return Err(missing(*id));
+            }
+        }
+        let mut ready = Vec::new();
+        // Use Core's order, not the order of a host-provided collection.
+        for run in data
+            .runs
+            .iter()
+            .filter(|run| run.state == RunState::Prepared)
+        {
+            let Some(saved_run) = saved_runs.get(&run.id) else {
+                continue;
+            };
+            let input = data.messages.iter().find(|m| m.id == run.input_message_id);
+            let saved_input = saved.messages.iter().find(|m| m.id == run.input_message_id);
+            let acp = data
+                .acp_sessions
+                .iter()
+                .find(|s| s.id == run.acp_session_id);
+            let saved_acp = saved
+                .acp_sessions
+                .iter()
+                .find(|s| s.id == run.acp_session_id);
+            // Active ACP metadata may change while a snapshot is being saved;
+            // its identity and execution configuration must remain the same.
+            let same_acp = acp.zip(saved_acp).is_some_and(|(a, b)| {
+                a.session_id == b.session_id
+                    && a.workspace == b.workspace
+                    && a.agent_id == b.agent_id
+            });
+            if serde_json::to_value(run)? != serde_json::to_value(saved_run)?
+                || serde_json::to_value(input)? != serde_json::to_value(saved_input)?
+                || !same_acp
+            {
+                return Err(Error::State(
+                    "saved execution does not match prepared data".into(),
+                ));
+            }
+            ready.push(run.clone());
+        }
+        Ok(ready)
+    }
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changes.subscribe()
     }
@@ -163,6 +216,18 @@ impl Memory {
             .find(|s| s.id == id)
             .cloned()
             .ok_or_else(|| missing(id))
+    }
+    pub fn list_sessions(&self, owner: Uuid) -> Result<Vec<AcpSession>> {
+        let data = self.lock()?;
+        if !data.sessions.iter().any(|s| s.id == owner) {
+            return Err(missing(owner));
+        }
+        Ok(data
+            .acp_sessions
+            .iter()
+            .filter(|s| s.session_id == owner)
+            .cloned()
+            .collect())
     }
     pub fn get_run(&self, id: Uuid) -> Result<Run> {
         self.lock()?

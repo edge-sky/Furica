@@ -1,7 +1,7 @@
 //! SessionManager coordinates ACP sessions, serial rounds and agent questions.
 //!
-//! It owns execution facts and conversation bindings. Base-model history stays in
-//! `orchestration`; SessionManager only publishes bounded events for that layer.
+//! The host manages business sessions, saves snapshots and reads execution state.
+//! Only the main-model workflow can prepare and control ACP work.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -33,7 +33,7 @@ use crate::{Error, Result};
 pub struct SessionLimits {
     /// Concurrent ACP sessions, each backed by one agent process.
     pub max_acp_sessions: usize,
-    /// Queued plus running rounds across all sessions.
+    /// Prepared, queued and running rounds across all sessions.
     pub max_runs: usize,
     /// Independent deadline for each pending agent question.
     pub question_timeout: Duration,
@@ -49,6 +49,24 @@ impl Default for SessionLimits {
     }
 }
 
+/// Host-facing session data, save acknowledgement and read-only ACP status.
+/// ACP commands are reserved for the main-model workflow.
+///
+/// ```compile_fail
+/// use furica_core::sessions::SessionManager;
+/// use uuid::Uuid;
+/// fn host_cannot_prepare_acp(manager: &SessionManager, session_id: Uuid) {
+///     manager.prepare_start(session_id, "request", "work".into());
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use furica_core::sessions::SessionManager;
+/// use uuid::Uuid;
+/// fn host_cannot_launch_acp(manager: &SessionManager, session_id: Uuid, run_id: Uuid) {
+///     manager.launch(session_id, run_id);
+/// }
+/// ```
 #[derive(Clone)]
 pub struct SessionManager(Arc<Inner>);
 
@@ -124,6 +142,19 @@ impl SessionManager {
     pub fn snapshot(&self) -> Result<SessionData> {
         self.0.data.snapshot()
     }
+    /// Confirm that the host successfully saved this exact snapshot. Core starts
+    /// only model-prepared runs contained in it, in their original preparation
+    /// order. Repeated acknowledgements do not repeat accepted work, and work
+    /// prepared during a save waits for its own acknowledgement.
+    ///
+    /// Call inside a Tokio runtime when the snapshot contains prepared work.
+    /// This confirms the host's save; it does not perform or verify storage I/O.
+    pub fn acknowledge_saved(&self, snapshot: &SessionData) -> Result<()> {
+        for run in self.0.data.saved_prepared_runs(snapshot)? {
+            self.launch(run.session_id, run.id)?;
+        }
+        Ok(())
+    }
     /// Subscribe before reading a snapshot. Notifications coalesce; reread the
     /// full snapshot after every change. This stream does not acknowledge saving.
     pub fn changes(&self) -> watch::Receiver<u64> {
@@ -176,6 +207,11 @@ impl SessionManager {
         self.0.data.get_session(id)
     }
 
+    /// List the ACP contexts belonging to one business session for host display.
+    pub fn acp_sessions(&self, session_id: Uuid) -> Result<Vec<AcpSession>> {
+        self.0.data.list_sessions(session_id)
+    }
+
     pub fn run(&self, id: Uuid) -> Result<Run> {
         self.0.data.get_run(id)
     }
@@ -201,9 +237,14 @@ impl SessionManager {
             .any(|question| question.session_id == session_id))
     }
 
-    /// Prepare data only. The host must save a snapshot containing this run
-    /// before explicitly calling launch. Model tools use the same entry points.
-    pub fn prepare_start(&self, session_id: Uuid, call_id: &str, prompt: String) -> Result<Run> {
+    /// Main-model tool entry point. Only prepare data; the host must save and
+    /// acknowledge a snapshot containing this run before Core starts execution.
+    pub(crate) fn prepare_start(
+        &self,
+        session_id: Uuid,
+        call_id: &str,
+        prompt: String,
+    ) -> Result<Run> {
         self.validate_request(session_id, call_id, &prompt)?;
         if self.0.shutdown.is_cancelled() {
             return Err(Error::Closed);
@@ -263,7 +304,7 @@ impl SessionManager {
         Ok(run)
     }
 
-    pub fn prepare_continue(
+    pub(crate) fn prepare_continue(
         &self,
         session_id: Uuid,
         call_id: &str,
@@ -316,9 +357,9 @@ impl SessionManager {
         Ok(run)
     }
 
-    /// Calling launch is the host's explicit authorization to execute previously
-    /// prepared data. Calling it again never repeats an accepted execution.
-    pub fn launch(&self, session_id: Uuid, run_id: Uuid) -> Result<Run> {
+    /// Schedule model-prepared work after a successful host save acknowledgement.
+    /// Calling it again never repeats an accepted execution.
+    fn launch(&self, session_id: Uuid, run_id: Uuid) -> Result<Run> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| Error::State("launch requires a Tokio runtime".into()))?;
         if self.0.shutdown.is_cancelled() {
@@ -395,15 +436,21 @@ impl SessionManager {
         Ok(run)
     }
 
-    pub fn status(&self, owner_id: Uuid, session_id: Uuid) -> Result<AcpStatus> {
-        let session = self.0.data.get_session(session_id)?;
-        self.require_owner(&session, owner_id)?;
-        self.status_snapshot(session_id)
+    /// Read an ACP context, its runs and pending questions without controlling it.
+    pub fn status(&self, session_id: Uuid, acp_session_id: Uuid) -> Result<AcpStatus> {
+        let session = self.0.data.get_session(acp_session_id)?;
+        self.require_owner(&session, session_id)?;
+        self.status_snapshot(acp_session_id)
     }
 
     /// Answering is a single transition. Repeated, expired and cross-conversation
     /// answers fail before anything reaches the original ACP request.
-    pub fn answer(&self, session_id: Uuid, question_id: Uuid, answer: Answer) -> Result<Question> {
+    pub(crate) fn answer(
+        &self,
+        session_id: Uuid,
+        question_id: Uuid,
+        answer: Answer,
+    ) -> Result<Question> {
         if self.0.shutdown.is_cancelled() {
             return Err(Error::Closed);
         }
@@ -466,7 +513,7 @@ impl SessionManager {
 
     /// Cancel the active round, or the oldest queued round if nothing is running.
     /// The ACP session stays open when cancellation is confirmed later.
-    pub fn cancel_run(&self, owner_id: Uuid, session_id: Uuid) -> Result<Run> {
+    pub(crate) fn cancel_run(&self, owner_id: Uuid, session_id: Uuid) -> Result<Run> {
         let session = self.0.data.get_session(session_id)?;
         self.require_owner(&session, owner_id)?;
         let prepared = self
@@ -531,7 +578,7 @@ impl SessionManager {
 
     /// Explicitly close the session. Pending questions are cancelled; an in-flight
     /// round is cancelled before the connection is released.
-    pub fn close(&self, owner_id: Uuid, session_id: Uuid) -> Result<AcpSession> {
+    pub(crate) fn close(&self, owner_id: Uuid, session_id: Uuid) -> Result<AcpSession> {
         let session = self.0.data.get_session(session_id)?;
         self.require_owner(&session, owner_id)?;
         self.cancel_prepared(Some(owner_id), Some(session_id))?;
@@ -603,7 +650,7 @@ impl SessionManager {
         }
     }
 
-    pub fn cancel_pending_questions(&self, session_id: Uuid) {
+    pub(crate) fn cancel_pending_questions(&self, session_id: Uuid) {
         let ids: Vec<_> = self
             .lock_questions()
             .map(|q| {

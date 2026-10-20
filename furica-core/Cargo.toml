@@ -6,10 +6,6 @@ rust-version = "1.88"
 description = "Headless voice session and ACP task orchestration core"
 license = "MIT"
 
-[[test]]
-name = "behavior"
-path = "tests/behavior/main.rs"
-
 [dependencies]
 async-trait = "0.1"
 futures-core = "0.3"

@@ -2,6 +2,9 @@
 //! this module owns turn scheduling, history, tool continuations and cancellation.
 
 mod inference;
+mod speech;
+use super::tools::CoreTools;
+pub(super) use speech::SpeechQueue;
 mod worker;
 
 use crate::{
@@ -20,7 +23,7 @@ pub struct CascadeConfig {
     pub channel_capacity: usize,
     pub max_utterance: Duration,
     pub max_generated_audio: Duration,
-    /// Covers the entire STT/model/TTS turn, not each stage separately.
+    /// Covers an STT/model turn. Also bounds each independent speech synthesis.
     pub inference_timeout: Duration,
     pub max_history_messages: usize,
     pub max_context_bytes: usize,
@@ -98,10 +101,11 @@ impl VoiceBackend for CascadedBackend {
         session_id: uuid::Uuid,
     ) -> Result<VoiceSession> {
         let history = sessions.main_history(session_id)?;
+        let tools = CoreTools::new(sessions.clone(), session_id, true);
         crate::text_model::validate_request(
             &crate::text_model::ModelRequest {
                 messages: history,
-                tools: crate::orchestration::execution_tools(),
+                tools: tools.definitions(),
                 instructions: self.config.instructions.clone(),
                 max_output_tokens: self.config.max_output_tokens,
                 reasoning: self.config.reasoning,
@@ -112,7 +116,7 @@ impl VoiceBackend for CascadedBackend {
         )?;
         sessions.set_instructions(session_id, self.config.instructions.as_deref())?;
         let (session, channels) = VoiceSession::channels(self.config.channel_capacity)?;
-        worker::spawn(self.clone(), channels, sessions, session_id);
+        worker::spawn(self.clone(), channels, sessions, session_id, tools);
         Ok(session)
     }
 }

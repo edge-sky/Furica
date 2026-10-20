@@ -1,5 +1,7 @@
 mod capture;
 mod pipeline;
+#[cfg(feature = "sensevoice")]
+mod stt;
 
 use std::{
     env,
@@ -13,7 +15,7 @@ use std::{
 };
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use furica_vad::{SAMPLE_RATE, SileroVad, VadConfig, VadEvent, VadOutput};
+use furica_local::{SAMPLE_RATE, SileroVad, VadConfig, VadEvent, VadOutput};
 use rtrb::Consumer;
 
 use capture::{Control, DEVICE_ERROR};
@@ -24,19 +26,25 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 struct Options {
     model: PathBuf,
     probabilities: bool,
+    transcribe: bool,
 }
 
 impl Options {
     fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Self>> {
         let mut model = None;
         let mut probabilities = false;
+        let mut transcribe = false;
         for arg in args {
             if arg == "--help" || arg == "-h" {
                 return Ok(None);
             } else if arg == "--probabilities" {
                 probabilities = true;
+            } else if arg == "--transcribe" {
+                transcribe = true;
             } else if arg.to_string_lossy().starts_with('-') || model.is_some() {
-                return Err("usage: microphone [model.onnx] [--probabilities]".into());
+                return Err(
+                    "usage: microphone [model.onnx] [--probabilities] [--transcribe]".into(),
+                );
             } else {
                 model = Some(PathBuf::from(arg));
             }
@@ -46,6 +54,7 @@ impl Options {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("model/silero_vad.onnx")
             }),
             probabilities,
+            transcribe,
         }))
     }
 }
@@ -53,10 +62,20 @@ impl Options {
 pub fn run() -> Result<()> {
     let Some(options) = Options::parse(env::args_os().skip(1))? else {
         println!(
-            "usage: microphone [model.onnx] [--probabilities]\ndefault model: {}/model/silero_vad.onnx\nCaptures the default macOS microphone until Ctrl+C. No audio is saved.",
+            "usage: microphone [model.onnx] [--probabilities] [--transcribe]\ndefault model: {}/model/silero_vad.onnx\n--transcribe requires --features sensevoice and the bundled local ASR model.\nCaptures the default macOS microphone until Ctrl+C. No audio is saved.",
             env!("CARGO_MANIFEST_DIR")
         );
         return Ok(());
+    };
+    #[cfg(not(feature = "sensevoice"))]
+    if options.transcribe {
+        return Err("--transcribe requires --features sensevoice".into());
+    }
+    #[cfg(feature = "sensevoice")]
+    let recognizer = if options.transcribe {
+        Some(stt::load()?)
+    } else {
+        None
     };
     // All model loading and processing buffers precede starting the device.
     let vad = SileroVad::from_file(&options.model, VadConfig::default())?;
@@ -83,6 +102,8 @@ pub fn run() -> Result<()> {
         error_tx,
     )
     .map_err(device_error)?;
+    #[cfg(feature = "sensevoice")]
+    let (speech_tx, speech_worker, speech_cancel) = stt::start(recognizer, Arc::clone(&control))?;
     eprintln!("模型: {}", options.model.display());
     eprintln!(
         "麦克风: {} | {rate} Hz | {channels} 声道 | {:?}",
@@ -98,14 +119,25 @@ pub fn run() -> Result<()> {
     let worker = thread::Builder::new()
         .name("microphone-vad".into())
         .spawn(move || {
-            let stdout = io::stdout();
+            #[cfg(feature = "sensevoice")]
+            if let Some(sender) = speech_tx {
+                return consume_with(
+                    consumer,
+                    &worker_control,
+                    pipeline,
+                    vad,
+                    options.probabilities,
+                    &mut io::stdout(),
+                    &mut stt::segments(sender),
+                );
+            }
             consume(
                 consumer,
                 &worker_control,
                 pipeline,
                 vad,
                 options.probabilities,
-                &mut stdout.lock(),
+                &mut io::stdout(),
             )
         })?;
     let started = stream.play();
@@ -133,6 +165,19 @@ pub fn run() -> Result<()> {
     let result = worker
         .join()
         .map_err(|_| "microphone inference thread panicked")?;
+    #[cfg(feature = "sensevoice")]
+    let speech_result = {
+        if result.is_err() || started.is_err() || stopped.is_err() {
+            speech_cancel.cancel();
+        }
+        if let Some(worker) = speech_worker {
+            worker
+                .join()
+                .map_err(|_| "speech recognition thread panicked")?
+        } else {
+            Ok(())
+        }
+    };
     started.map_err(device_error)?;
     stopped.map_err(device_error)?;
     if control.fault() == DEVICE_ERROR
@@ -140,7 +185,10 @@ pub fn run() -> Result<()> {
     {
         return Err(device_error(error));
     }
-    result
+    result?;
+    #[cfg(feature = "sensevoice")]
+    speech_result?;
+    Ok(())
 }
 
 fn device_error(error: cpal::Error) -> Box<dyn Error + Send + Sync> {
@@ -153,12 +201,32 @@ fn device_error(error: cpal::Error) -> Box<dyn Error + Send + Sync> {
 }
 
 fn consume(
+    input: Consumer<f32>,
+    control: &Control,
+    pipeline: Pipeline,
+    vad: SileroVad,
+    probabilities: bool,
+    output: &mut impl Write,
+) -> Result<()> {
+    consume_with(
+        input,
+        control,
+        pipeline,
+        vad,
+        probabilities,
+        output,
+        &mut |_, _, _| Ok(()),
+    )
+}
+
+fn consume_with(
     mut input: Consumer<f32>,
     control: &Control,
     mut pipeline: Pipeline,
     mut vad: SileroVad,
     probabilities: bool,
     output: &mut impl Write,
+    recognize: &mut impl FnMut(&[i16], u64, VadOutput) -> Result<()>,
 ) -> Result<()> {
     let mut position = 0_u64;
     loop {
@@ -172,6 +240,7 @@ fn consume(
                 let result = vad.process(frame)?;
                 control.check()?;
                 write_output(output, position, result, probabilities)?;
+                recognize(frame, position, result)?;
                 position = position
                     .checked_add(frame.len() as u64)
                     .ok_or("VAD output position overflow")?;
@@ -187,6 +256,14 @@ fn consume(
             control.check()?;
             if let Some(event) = vad.finish()? {
                 write_event(output, event)?;
+                recognize(
+                    &[],
+                    position,
+                    VadOutput {
+                        speech_probability: 0.0,
+                        event: Some(event),
+                    },
+                )?;
             }
             let (native, pcm) = pipeline.pending();
             eprintln!(

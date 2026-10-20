@@ -1,6 +1,6 @@
 use std::{ffi::OsString, sync::atomic::Ordering};
 
-use furica_vad::FRAME_SAMPLES;
+use furica_local::FRAME_SAMPLES;
 
 use super::{
     capture::{self, Control},

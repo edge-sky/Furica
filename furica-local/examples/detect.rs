@@ -6,7 +6,7 @@ use std::{
     io::{BufRead, BufReader, Read},
 };
 
-use furica_vad::{FRAME_SAMPLES, SileroVad, VadConfig};
+use furica_local::{FRAME_SAMPLES, SileroVad, VadConfig};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = env::args_os().skip(1).collect();

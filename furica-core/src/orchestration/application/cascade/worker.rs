@@ -1,8 +1,10 @@
 //! Command receipt, turn queues, tool continuations and cancellation.
 
+use super::super::tools::CoreTools;
 use super::{
     CascadedBackend,
     inference::{TurnInput, TurnResult, infer},
+    speech::SpeechQueue,
 };
 use crate::{
     Error, Result,
@@ -11,7 +13,7 @@ use crate::{
     stt::{self, Utterance},
     text_model::{FinishReason, ModelMessage, message_size, validate_text},
 };
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -21,8 +23,11 @@ pub(super) fn spawn(
     channels: VoiceChannels,
     sessions: crate::sessions::SessionManager,
     session_id: Uuid,
+    tools: CoreTools,
 ) {
     let worker = CascadeWorker {
+        speech: SpeechQueue::new(backend.clone(), channels.cancelled.clone()),
+        tools,
         backend,
         channels,
         sessions,
@@ -30,7 +35,6 @@ pub(super) fn spawn(
         frames: Vec::new(),
         samples: 0,
         speaking: false,
-        waiting_tools: HashSet::new(),
         pending: VecDeque::new(),
         job: None,
     };
@@ -45,15 +49,17 @@ struct CascadeWorker {
     frames: Vec<AudioFrame>,
     samples: usize,
     speaking: bool,
-    waiting_tools: HashSet<String>,
+    tools: CoreTools,
     pending: VecDeque<TurnInput>,
     job: Option<(JoinHandle<Result<TurnResult>>, CancellationToken)>,
+    speech: SpeechQueue,
 }
 
 impl CascadeWorker {
     async fn run(mut self) {
         let result = self.run_inner().await;
         self.cancel_job();
+        self.speech.clear();
         if let Err(error) = result {
             // Do not wait on an abandoned/full output queue during shutdown.
             let _ = self
@@ -65,6 +71,7 @@ impl CascadeWorker {
 
     async fn run_inner(&mut self) -> Result<()> {
         loop {
+            let audio_sender = self.channels.events.clone();
             tokio::select! {
                 biased;
                 _ = self.channels.cancelled.cancelled() => return Ok(()),
@@ -79,14 +86,24 @@ impl CascadeWorker {
                     self.complete(result)?;
                     self.emit(VoiceEvent::ResponseFinished)?;
                 }
+                result = async { (&mut self.speech.job.as_mut().expect("guarded speech job").0).await }, if self.speech.job.is_some() => {
+                    let (_, cancel) = self.speech.job.take().expect("completed speech job");
+                    cancel.cancel();
+                    let audio = result.map_err(|error| Error::Protocol(format!("speech worker failed: {error}")))??;
+                    self.speech.synthesized(audio);
+                }
+                permit = audio_sender.reserve_owned(), if self.speech.has_audio() => {
+                    permit.map_err(|_| Error::Closed)?.send(self.speech.next_audio());
+                }
             }
+            self.speech.start_next();
             if self.job.is_none()
                 && !self.speaking
-                && self.waiting_tools.is_empty()
                 && let Some(input) = self.pending.pop_front()
             {
                 self.emit(VoiceEvent::ResponseStarted)?;
                 let backend = self.backend.clone();
+                let tools = self.tools.definitions();
                 let history = self.sessions.main_history(self.session_id)?;
                 let sessions = self.sessions.clone();
                 let session_id = self.session_id;
@@ -95,7 +112,15 @@ impl CascadeWorker {
                 let job = tokio::spawn(async move {
                     tokio::time::timeout(
                         backend.config.inference_timeout,
-                        infer(backend, history, sessions, session_id, input, worker_cancel),
+                        infer(
+                            backend,
+                            history,
+                            sessions,
+                            session_id,
+                            tools,
+                            input,
+                            worker_cancel,
+                        ),
                     )
                     .await
                     .unwrap_or(Err(Error::Timeout("cascaded inference")))
@@ -226,21 +251,17 @@ impl CascadeWorker {
                 self.remember(ModelMessage::ExecutionUpdate(update))?;
                 self.queue(TurnInput::Continue)?;
             }
-            VoiceCommand::ToolResult { call_id, result } => {
-                if !self.waiting_tools.remove(&call_id) {
-                    return Err(Error::Protocol("unexpected model tool result".into()));
-                }
-                self.remember(ModelMessage::ToolResult { call_id, result })?;
-                if self.waiting_tools.is_empty() {
-                    self.queue(TurnInput::Continue)?;
-                }
+            VoiceCommand::ToolResult { .. } => {
+                return Err(Error::Protocol("unexpected model tool result".into()));
             }
             VoiceCommand::Interrupt { .. } => {
                 self.cancel_job();
+                self.speech.clear();
                 self.pending.clear();
                 // ACP tasks already accepted remain managed by Core/SessionManager.
                 self.emit(VoiceEvent::ResponseFinished)?;
             }
+            VoiceCommand::Playback(position) => self.speech.playback(&position),
         }
         Ok(())
     }
@@ -267,24 +288,13 @@ impl CascadeWorker {
                     final_chunk: response.finish_reason != FinishReason::Truncated,
                 })?;
             }
+            let has_calls = !calls.is_empty();
             for call in calls {
-                self.waiting_tools.insert(call.call_id.clone());
-                self.emit(VoiceEvent::ToolCall {
-                    call_id: call.call_id,
-                    name: call.name,
-                    arguments: call.arguments,
-                })?;
+                let result = self.tools.invoke(call, Some(&mut self.speech));
+                self.remember(result)?;
             }
-            if let Some(audio) = result.audio {
-                let item_id = Uuid::new_v4().to_string();
-                for samples in audio.samples.chunks(audio.sample_rate as usize) {
-                    self.emit(VoiceEvent::Audio {
-                        item_id: item_id.clone(),
-                        content_index: 0,
-                        sample_rate: audio.sample_rate,
-                        samples: samples.to_vec(),
-                    })?;
-                }
+            if has_calls {
+                self.queue(TurnInput::Continue)?;
             }
         }
         Ok(())

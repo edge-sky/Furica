@@ -1,4 +1,4 @@
-use furica_vad::{FRAME_SAMPLES, SAMPLE_RATE};
+use furica_local::{FRAME_SAMPLES, SAMPLE_RATE};
 use rubato::{
     Async, FixedAsync, Resampler, SincInterpolationParameters,
     audioadapter_buffers::direct::InterleavedSlice,

@@ -94,6 +94,7 @@ impl Core {
             pending: AudioBuffer::new(config.sample_rate, config.connect_buffer),
             config,
             backend,
+            tools: super::CoreTools::new(sessions.clone(), session_id, false),
             sessions,
             commands: command_rx,
             audio: audio_rx,

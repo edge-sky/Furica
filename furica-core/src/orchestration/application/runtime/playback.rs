@@ -49,8 +49,9 @@ impl Actor {
                     "playback position is outside delivered audio".into(),
                 ));
             }
-            *current = position;
+            *current = position.clone();
             self.last_activity = Instant::now();
+            self.send(VoiceCommand::Playback(position))?;
         }
         self.announce_result()?;
         Ok(())

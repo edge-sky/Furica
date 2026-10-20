@@ -28,6 +28,9 @@ pub enum VoiceCommand {
         call_id: String,
         result: Value,
     },
+    /// Host-confirmed progress for the current audio item. A queued speech
+    /// request remains active until all of its delivered audio has played.
+    Playback(PlaybackPosition),
     Interrupt {
         playback: Option<PlaybackPosition>,
         cancel_response: bool,

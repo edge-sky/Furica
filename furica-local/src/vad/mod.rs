@@ -1,12 +1,10 @@
-#![doc = include_str!("../README.md")]
-
-mod model;
-mod trigger;
+mod domain;
+mod infrastructure;
 
 use std::{error::Error, path::Path, time::Duration};
 
-use model::Model;
-use trigger::Trigger;
+use domain::trigger::Trigger;
+use infrastructure::model::Model;
 
 /// Required sample rate. Callers perform resampling and channel mixing.
 pub const SAMPLE_RATE: u32 = 16_000;

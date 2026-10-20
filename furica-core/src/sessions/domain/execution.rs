@@ -393,7 +393,7 @@ pub struct QuestionDraft {
     pub kind: QuestionKind,
 }
 
-/// Snapshot returned by `get_task_status`.
+/// Read-only ACP work status for the host and the main-model status tool.
 #[derive(Clone, Debug, Serialize)]
 pub struct AcpStatus {
     pub session: AcpSession,

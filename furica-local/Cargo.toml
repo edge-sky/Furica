@@ -1,0 +1,40 @@
+[package]
+name = "furica-local"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Local speech capabilities: Silero VAD and SenseVoiceSmall STT"
+license = "MIT"
+readme = "README.md"
+
+[features]
+default = []
+sensevoice = ["dep:async-trait", "dep:furica-core", "dep:kaldi-fbank", "dep:scopeguard", "dep:tokio", "dep:tokio-util"]
+
+[dependencies]
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "download-binaries", "copy-dylibs"] }
+thiserror = "2"
+async-trait = { version = "0.1", optional = true }
+furica-core = { path = "../furica-core", optional = true }
+kaldi-fbank = { version = "=0.1.0", optional = true }
+scopeguard = { version = "1.2", optional = true }
+tokio = { version = "1", features = ["rt", "sync"], optional = true }
+tokio-util = { version = "0.7", features = ["rt"], optional = true }
+
+[dev-dependencies]
+sha2 = "0.10"
+tempfile = "3"
+hound = "3.5"
+
+[[example]]
+name = "transcribe"
+required-features = ["sensevoice"]
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+cpal = "=0.18.2"
+ctrlc = { version = "3.5", features = ["termination"] }
+rubato = { version = "=5.0.1", default-features = false }
+rtrb = "0.3"
+
+[lints.rust]
+unsafe_code = "forbid"

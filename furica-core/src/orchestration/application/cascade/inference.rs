@@ -3,10 +3,8 @@
 use super::CascadedBackend;
 use crate::{
     Result,
-    orchestration::execution_tools,
     stt::{self, Utterance},
     text_model::{self, FinishReason, ModelMessage, ModelRequest, ModelResponse},
-    tts::{self, SynthesizedAudio},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -19,7 +17,6 @@ pub(super) enum TurnInput {
 pub(super) struct TurnResult {
     pub(super) user_text: Option<String>,
     pub(super) response: Option<ModelResponse>,
-    pub(super) audio: Option<SynthesizedAudio>,
 }
 
 pub(super) async fn infer(
@@ -27,6 +24,7 @@ pub(super) async fn infer(
     mut history: Vec<ModelMessage>,
     sessions: crate::sessions::SessionManager,
     session_id: uuid::Uuid,
+    tools: Vec<text_model::ToolDefinition>,
     input: TurnInput,
     cancel: CancellationToken,
 ) -> Result<TurnResult> {
@@ -57,7 +55,6 @@ pub(super) async fn infer(
             return Ok(TurnResult {
                 user_text: None,
                 response: None,
-                audio: None,
             });
         }
         let message = ModelMessage::User(text.clone());
@@ -73,7 +70,7 @@ pub(super) async fn infer(
         backend.model.as_ref(),
         ModelRequest {
             messages: history,
-            tools: execution_tools(),
+            tools,
             instructions: backend.config.instructions.clone(),
             max_output_tokens: backend.config.max_output_tokens,
             reasoning: backend.config.reasoning,
@@ -96,29 +93,8 @@ pub(super) async fn infer(
         ModelMessage::Assistant(response.message.clone()),
         state,
     )?;
-    let reply = response.message.text();
-    let audio = if matches!(
-        response.finish_reason,
-        FinishReason::Complete | FinishReason::Refused
-    ) && !reply.trim().is_empty()
-    {
-        Some(
-            tts::synthesize(
-                backend.tts.as_ref(),
-                reply,
-                backend.config.sample_rate,
-                backend.config.max_generated_audio,
-                backend.config.max_context_bytes,
-                cancel,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
     Ok(TurnResult {
         user_text: text,
         response: Some(response),
-        audio,
     })
 }
