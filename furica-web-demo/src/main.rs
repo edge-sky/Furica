@@ -1,7 +1,7 @@
 mod bootstrap;
 mod conversation;
 mod infrastructure;
-mod tasks;
+mod sessions;
 
 use std::{path::PathBuf, sync::Arc};
 

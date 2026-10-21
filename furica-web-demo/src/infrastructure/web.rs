@@ -1,5 +1,5 @@
 //! Loopback HTTP/WebSocket transport. Exactly one browser owns the device session
-//! and TaskStore, including while the owner is shutting down.
+//! and snapshot writer, including while the owner is shutting down.
 use crate::{
     bootstrap::Config,
     conversation::{Command, Session, infrastructure::input::decode_audio, presentation},
@@ -177,6 +177,7 @@ async fn http(
             "text/css; charset=utf-8",
             include_str!("../../web/style.css"),
         ),
+        "/favicon.svg" => ("image/svg+xml", include_str!("../../web/favicon.svg")),
         "/app.js" => (
             "text/javascript; charset=utf-8",
             include_str!("../../web/app.js"),
@@ -189,9 +190,9 @@ async fn http(
             "text/javascript; charset=utf-8",
             include_str!("../../web/conversation/capture-worklet.js"),
         ),
-        "/tasks/panel.js" => (
+        "/sessions/panel.js" => (
             "text/javascript; charset=utf-8",
-            include_str!("../../web/tasks/panel.js"),
+            include_str!("../../web/sessions/panel.js"),
         ),
         "/diagnostics.js" => (
             "text/javascript; charset=utf-8",
@@ -239,13 +240,20 @@ where
     let mut session: Option<Session> = None;
     let result=async {
         send(&mut socket,config.public_status()).await?;
+        match crate::sessions::SnapshotStore::configured().load() {
+            Ok(data) => send(&mut socket, crate::sessions::snapshot(data)).await?,
+            Err(error) => send(&mut socket, json!({"type":"save_error","message":error.to_string()})).await?,
+        }
         loop {
             tokio::select! {
                 _=stop.cancelled()=>break,
                 event=async {match &mut session {Some(session)=>session.next().await,None=>std::future::pending().await}}=>{
                     let stopped=event["type"]=="kernel_stopped";
                     send(&mut socket,event).await?;
-                    if stopped && let Some(old)=session.take(){old.stop().await?;}
+                    if stopped && let Some(old)=session.take(){
+                        old.stop().await?;
+                        send(&mut socket,crate::sessions::snapshot(crate::sessions::SnapshotStore::configured().load()?)).await?;
+                    }
                 }
                 incoming=socket.next()=>{
                     let Some(incoming)=incoming else {break};
@@ -258,12 +266,12 @@ where
                                 Err(_)=>{send(&mut socket,json!({"type":"error","message":"无效的控制消息或字段"})).await?;continue;},
                             };
                             match command {
-                                Command::Start {mode,speaker}=>{
+                                Command::Start {mode,speaker,session_id}=>{
                                     if session.is_some(){send(&mut socket,json!({"type":"error","message":"请先停止当前内核"})).await?;continue;}
-                                    match Session::start(&config,mode,&speaker).await {
+                                    match Session::start(&config,mode,&speaker,session_id).await {
                                         Ok(started)=>{
-                                            send(&mut socket,json!({"type":"started","state":presentation::state(started.core.state())})).await?;
-                                            send(&mut socket,crate::tasks::snapshot(&started.store)?).await?;
+                                            send(&mut socket,json!({"type":"started","state":presentation::state(started.core.state()),"session_id":started.session_id})).await?;
+                                            send(&mut socket,crate::sessions::snapshot(started.manager.snapshot()?)).await?;
                                             let playback=presentation::playback(*started.output.playback.borrow());
                                             send(&mut socket,playback).await?;
                                             session=Some(started);
@@ -274,6 +282,13 @@ where
                                 Command::Stop=>{
                                     if let Some(old)=session.take(){old.stop().await?;}
                                     send(&mut socket,json!({"type":"stopped"})).await?;
+                                    send(&mut socket,crate::sessions::snapshot(crate::sessions::SnapshotStore::configured().load()?)).await?;
+                                }
+                                Command::Snapshot if session.is_none() => {
+                                    match crate::sessions::SnapshotStore::configured().load() {
+                                        Ok(data) => send(&mut socket,crate::sessions::snapshot(data)).await?,
+                                        Err(error) => send(&mut socket,json!({"type":"save_error","message":error.to_string()})).await?,
+                                    }
                                 }
                                 command=>{
                                     match &session {

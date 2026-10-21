@@ -10,8 +10,8 @@ publish = false
 
 [dependencies]
 furica-core = { path = "../furica-core" }
-furica-vad = { path = "../furica-vad" }
-furica-adapters = { path = "../furica-adapters", features = ["aliyun", "volcengine", "openai-compatible", "openai-responses", "anthropic"] }
+furica-local = { path = "../furica-local" }
+furica-adapters = { path = "../furica-adapters", features = ["acp", "aliyun", "volcengine", "openai-compatible", "openai-responses", "anthropic"] }
 async-trait = "0.1"
 bytes = "1"
 futures-util = { version = "0.3", features = ["sink"] }

@@ -3,6 +3,7 @@ use furica_core::{
     input::SpeakerDecision,
     orchestration::{CoreEvent, CoreState},
     playback::{PlaybackChunk, PlaybackState},
+    sessions::SessionEvent,
 };
 use serde_json::{Value, json};
 
@@ -25,7 +26,22 @@ pub fn event(event: CoreEvent) -> Value {
             text,
             final_chunk,
         } => json!({"type":"transcript","user":user,"text":text,"final_chunk":final_chunk}),
-        CoreEvent::Task(value) => crate::tasks::event(value),
+        CoreEvent::Execution(SessionEvent::Progress {
+            session_id,
+            run_id,
+            update,
+        }) => {
+            json!({"type":"execution_changed", "kind":"progress", "session_id":session_id, "run_id":run_id, "update":update})
+        }
+        CoreEvent::Execution(SessionEvent::Error {
+            session_id,
+            acp_session_id,
+            run_id,
+            message,
+        }) => {
+            json!({"type":"execution_changed", "kind":"error", "session_id":session_id, "acp_session_id":acp_session_id, "run_id":run_id, "message":message})
+        }
+        CoreEvent::Execution(_) => json!({"type":"execution_changed"}),
         CoreEvent::ClearPlayback => json!({"type":"clear_playback"}),
         CoreEvent::Speaker(value) => match value {
             SpeakerDecision::Accepted { speaker_id } => {
