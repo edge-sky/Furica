@@ -1,15 +1,21 @@
 //! Request-local protocol lifecycle, bounded buffering and Core event conversion.
 use crate::infrastructure::text::{self, Sse, bad};
 use furica_core::{Error, Result, text_model::*};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 
-pub(super) fn open(sse: Sse) -> ModelStream {
+pub(super) fn open(sse: Sse, source: String) -> ModelStream {
     let state = State {
         sse,
         queue: VecDeque::new(),
         tools: BTreeMap::new(),
         text: None,
+        reasoning: None,
+        source,
+        answer: String::new(),
+        thought: String::new(),
+        saw_reasoning: false,
+        native_tools: Vec::new(),
         next: 0,
         finish: None,
         usage: None,
@@ -38,12 +44,19 @@ struct Tool {
     index: usize,
     id: String,
     name: String,
+    arguments: String,
 }
 struct State {
     sse: Sse,
     queue: VecDeque<ModelEvent>,
     tools: BTreeMap<usize, Tool>,
     text: Option<usize>,
+    reasoning: Option<usize>,
+    source: String,
+    answer: String,
+    thought: String,
+    saw_reasoning: bool,
+    native_tools: Vec<Value>,
     next: usize,
     finish: Option<FinishReason>,
     usage: Option<ModelUsage>,
@@ -66,6 +79,18 @@ impl State {
             self.queue.push_back(ModelEvent::ContentEnd { index });
         }
     }
+    fn close_reasoning(&mut self) {
+        if let Some(index) = self.reasoning.take() {
+            self.queue.push_back(ModelEvent::ContentEnd { index });
+        }
+    }
+    fn retain(&mut self, size: usize) -> Result<()> {
+        if size > text::LIMIT.saturating_sub(self.retained) {
+            return Err(Error::Busy("Chat response buffer"));
+        }
+        self.retained += size;
+        Ok(())
+    }
     async fn read(&mut self) -> Result<()> {
         let (event, data) = self.sse.next().await?;
         if !event.is_empty() && event != "message" {
@@ -76,10 +101,23 @@ impl State {
             if self.refused && reason == FinishReason::Complete {
                 reason = FinishReason::Refused;
             }
+            let continuation = if self.saw_reasoning {
+                let mut native = json!({"role":"assistant", "content":std::mem::take(&mut self.answer), "reasoning_content":std::mem::take(&mut self.thought)});
+                if !self.native_tools.is_empty() {
+                    native["tool_calls"] = json!(std::mem::take(&mut self.native_tools));
+                }
+                text::bounded(&native)?;
+                Some(ModelContinuation {
+                    source: self.source.clone(),
+                    data: native,
+                })
+            } else {
+                None
+            };
             self.queue.push_back(ModelEvent::Finished {
                 reason,
                 usage: self.usage.take(),
-                continuation: None,
+                continuation,
             });
             self.done = true;
             return Ok(());
@@ -116,15 +154,44 @@ impl State {
         {
             return Err(bad());
         }
-        if d.get("reasoning_content").is_some_and(|v| !v.is_null())
-            || d.get("audio").is_some_and(|v| !v.is_null())
+        if d.get("audio").is_some_and(|v| !v.is_null())
             || d.get("function_call").is_some_and(|v| !v.is_null())
         {
             return Err(bad());
         }
+        if let Some(value) = d.get("reasoning_content").filter(|v| !v.is_null()) {
+            let thought = value.as_str().ok_or_else(|| {
+                Error::Protocol("Chat Completions reasoning_content must be a string".into())
+            })?;
+            self.saw_reasoning = true;
+            // Providers often send empty placeholders in the role header.
+            if !thought.is_empty() {
+                self.retain(thought.len())?;
+                self.close_text();
+                let index = if let Some(index) = self.reasoning {
+                    index
+                } else {
+                    let index = self.allocate()?;
+                    self.reasoning = Some(index);
+                    self.queue.push_back(ModelEvent::ReasoningStart { index });
+                    index
+                };
+                self.thought.push_str(thought);
+                self.queue.push_back(ModelEvent::ReasoningDelta {
+                    index,
+                    text: thought.into(),
+                });
+            }
+        }
         for field in ["content", "refusal"] {
             if let Some(value) = d.get(field).filter(|v| !v.is_null()) {
                 let text = value.as_str().ok_or_else(bad)?;
+                if text.is_empty() {
+                    continue;
+                }
+                self.retain(text.len())?;
+                self.close_reasoning();
+                self.answer.push_str(text);
                 if field == "refusal" {
                     self.refused = true;
                 }
@@ -145,6 +212,7 @@ impl State {
         if let Some(calls) = d.get("tool_calls").filter(|v| !v.is_null()) {
             for call in calls.as_array().ok_or_else(bad)? {
                 self.close_text();
+                self.close_reasoning();
                 let key = text::index(call, "index")?;
                 if !self.tools.contains_key(&key) {
                     if self.tools.len() >= 32 {
@@ -157,6 +225,7 @@ impl State {
                             index,
                             id: String::new(),
                             name: String::new(),
+                            arguments: String::new(),
                         },
                     );
                 }
@@ -190,6 +259,7 @@ impl State {
                             return Err(Error::Busy("Chat tool parameter buffer"));
                         }
                         self.retained += args.len();
+                        t.arguments.push_str(args);
                         self.arguments.push_back((key, args.into()));
                     }
                 }
@@ -204,6 +274,7 @@ impl State {
                 _ => return Err(bad()),
             });
             self.close_text();
+            self.close_reasoning();
             // Header fields may be fragmented alongside arguments. Only the
             // finish marker proves them stable; retain bounded argument fragments
             // and replay their interleaving after publishing complete headers.
@@ -211,6 +282,7 @@ impl State {
             positions.sort_unstable();
             for (t, index) in self.tools.values_mut().zip(positions) {
                 t.index = index;
+                self.native_tools.push(json!({"id":t.id,"type":"function","function":{"name":t.name,"arguments":std::mem::take(&mut t.arguments)}}));
                 self.queue.push_back(ModelEvent::ToolStart {
                     index: t.index,
                     call_id: t.id.clone(),

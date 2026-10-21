@@ -452,7 +452,7 @@ async fn chat_rejects_missing_completion_conflicting_finish_and_bad_tools() {
         ),
         chat_body(
             vec![chat_event(
-                json!({"reasoning_content":"unsupported dialect"}),
+                json!({"reasoning_content":["unsupported type"]}),
                 json!("stop"),
             )],
             true,
@@ -818,4 +818,233 @@ async fn anthropic_effort_and_budget_remain_distinct_controls() {
         req.reasoning = Some(Reasoning::BudgetTokens(2048));
         assert!(matches!(generate(&model, req).await, Err(Error::Config(_))));
     }
+}
+
+#[cfg(feature = "openai-compatible")]
+#[tokio::test]
+async fn chat_reasoning_fragments_survive_persistence_and_tool_continuation() {
+    let body = chat_body(
+        vec![
+            chat_event(
+                json!({"role":"assistant","content":"","reasoning_content":""}),
+                Value::Null,
+            ),
+            chat_event(json!({"reasoning_content":"先检查"}), Value::Null),
+            chat_event(
+                json!({"reasoning_content":"参数。","content":null}),
+                Value::Null,
+            ),
+            chat_event(json!({"content":"执行中"}), Value::Null),
+            chat_event(
+                json!({"tool_calls":[{"index":0,"id":"call_","type":"function","function":{"name":"r","arguments":"{ \"x\" :"}}]}),
+                Value::Null,
+            ),
+            chat_event(
+                json!({"tool_calls":[{"index":0,"id":"1","function":{"name":"un","arguments":" 1 }"}}]}),
+                json!("tool_calls"),
+            ),
+            json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"completion_tokens_details":{"reasoning_tokens":8}}}),
+        ],
+        true,
+    );
+    let (url, wire, handle) = server(body, 1, true).await;
+    let response = generate(chat(url).as_ref(), request()).await.unwrap();
+    assert_eq!(response.finish_reason, FinishReason::ToolCalls);
+    assert_eq!(response.message.text(), "执行中");
+    assert_eq!(
+        response.message.content[0],
+        ModelContent::ReasoningSummary("先检查参数。".into())
+    );
+    assert_eq!(
+        response.message.tool_calls().next().unwrap().arguments,
+        json!({"x":1})
+    );
+    let native = response.message.continuation.as_ref().unwrap().data.clone();
+    assert_eq!(native["reasoning_content"], "先检查参数。");
+    assert_eq!(
+        native["tool_calls"][0]["function"]["arguments"],
+        "{ \"x\" : 1 }"
+    );
+    assert_eq!(response.usage.unwrap().reasoning_tokens, Some(8));
+    let _ = wire.await.unwrap();
+    closed(handle).await;
+    // Session persistence round trip retains source, native reasoning and exact argument bytes.
+    let mut saved: AssistantMessage =
+        serde_json::from_str(&serde_json::to_string(&response.message).unwrap()).unwrap();
+    let reply = chat_body(
+        vec![
+            chat_event(json!({"reasoning_content":"工具已返回。"}), Value::Null),
+            chat_event(json!({"content":"完成"}), json!("stop")),
+        ],
+        true,
+    );
+    let (url, wire, handle) = server(reply, 3, true).await;
+    let model = chat(url);
+    // Only this fixture changes endpoint identity to inspect replay through a second listener.
+    saved.continuation.as_mut().unwrap().source = model.continuation_source().into();
+    let mut next = request();
+    next.messages.push(ModelMessage::Assistant(saved));
+    next.messages.push(ModelMessage::ToolResult {
+        call_id: "call_1".into(),
+        result: json!({"ok":true}),
+    });
+    let result = generate(model.as_ref(), next).await.unwrap();
+    assert_eq!(result.message.text(), "完成");
+    let (_, outgoing) = wire.await.unwrap();
+    assert_eq!(outgoing["messages"][3], native);
+    assert_eq!(outgoing["messages"].as_array().unwrap().len(), 5);
+    assert_eq!(outgoing["messages"][4]["tool_call_id"], "call_1");
+    closed(handle).await;
+}
+
+#[cfg(feature = "openai-compatible")]
+#[tokio::test]
+async fn chat_empty_and_null_reasoning_headers_are_compatible() {
+    for placeholder in [Value::Null, json!("")] {
+        let body = chat_body(
+            vec![
+                chat_event(
+                    json!({"role":"assistant","content":"","reasoning_content":placeholder}),
+                    Value::Null,
+                ),
+                chat_event(json!({"content":"OK"}), json!("stop")),
+            ],
+            true,
+        );
+        let (url, wire, handle) = server(body, 1, true).await;
+        let result = generate(chat(url).as_ref(), request()).await.unwrap();
+        assert_eq!(
+            result.message.content,
+            vec![ModelContent::Text("OK".into())]
+        );
+        assert_eq!(
+            result.message.continuation.is_some(),
+            !placeholder.is_null()
+        );
+        let _ = wire.await.unwrap();
+        closed(handle).await;
+    }
+}
+
+#[cfg(feature = "openai-compatible")]
+#[tokio::test]
+async fn chat_native_reasoning_rejects_changed_projection_and_foreign_sources_before_network() {
+    let model = chat("http://127.0.0.1:1/not-listening".into());
+    let message = AssistantMessage {
+        content: vec![
+            ModelContent::ReasoningSummary("plan".into()),
+            ModelContent::Text("answer".into()),
+            ModelContent::ToolCall(ToolCall {
+                call_id: "a".into(),
+                name: "run".into(),
+                arguments: json!({"x":1}),
+            }),
+        ],
+        continuation: Some(ModelContinuation {
+            source: model.continuation_source().into(),
+            data: json!({"role":"assistant","content":"answer","reasoning_content":"plan","tool_calls":[{"id":"a","type":"function","function":{"name":"run","arguments":"{ \"x\": 1 }"}}]}),
+        }),
+    };
+    let mut changes = Vec::new();
+    let mut changed = message.clone();
+    changed.content[0] = ModelContent::ReasoningSummary("modified".into());
+    changes.push(changed);
+    let mut changed = message.clone();
+    changed.content[1] = ModelContent::Text("modified".into());
+    changes.push(changed);
+    let mut changed = message.clone();
+    if let ModelContent::ToolCall(call) = &mut changed.content[2] {
+        call.arguments = json!({"x":2});
+    }
+    changes.push(changed);
+    let mut changed = message.clone();
+    changed.continuation.as_mut().unwrap().data["role"] = json!("system");
+    changes.push(changed);
+    let mut changed = message.clone();
+    changed.continuation.as_mut().unwrap().data["unexpected"] = json!(true);
+    changes.push(changed);
+    let mut changed = message.clone();
+    changed.continuation.as_mut().unwrap().source = "another-account".into();
+    changes.push(changed);
+    let mut changed = message.clone();
+    changed.continuation = None;
+    changes.push(changed);
+    for changed in changes {
+        let mut r = request();
+        r.messages.push(ModelMessage::Assistant(changed));
+        r.messages.push(ModelMessage::ToolResult {
+            call_id: "a".into(),
+            result: json!({}),
+        });
+        let error = generate(model.as_ref(), r).await.unwrap_err();
+        assert!(matches!(error, Error::Config(_) | Error::Protocol(_)));
+        assert!(
+            !error.to_string().contains("transport failed"),
+            "replay validation reached network"
+        );
+    }
+}
+
+#[cfg(feature = "openai-compatible")]
+#[tokio::test]
+async fn chat_reasoning_remains_bounded_and_requires_terminal_event() {
+    let (url, wire, handle) = server(
+        chat_body(
+            vec![chat_event(
+                json!({"reasoning_content":"partial"}),
+                json!("stop"),
+            )],
+            false,
+        ),
+        4096,
+        false,
+    )
+    .await;
+    assert!(generate(chat(url).as_ref(), request()).await.is_err());
+    let _ = wire.await.unwrap();
+    closed(handle).await;
+    for invalid in [
+        json!(false),
+        json!(10),
+        json!([]),
+        json!({"secret":"test-secret"}),
+    ] {
+        let (url, wire, handle) = server(
+            chat_body(
+                vec![chat_event(
+                    json!({"reasoning_content":invalid}),
+                    json!("stop"),
+                )],
+                true,
+            ),
+            4096,
+            true,
+        )
+        .await;
+        let error = generate(chat(url).as_ref(), request()).await.unwrap_err();
+        assert!(!error.to_string().contains("test-secret"));
+        let _ = wire.await.unwrap();
+        closed(handle).await;
+    }
+    let events = (0..9)
+        .map(|_| {
+            chat_event(
+                json!({"reasoning_content":"x".repeat(128*1024)}),
+                Value::Null,
+            )
+        })
+        .collect();
+    let (url, wire, handle) = server(chat_body(events, true), 8192, true).await;
+    let error = text_model::generate(
+        chat(url).as_ref(),
+        request(),
+        128,
+        4 * 1024 * 1024,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::Busy(_)));
+    let _ = wire.await.unwrap();
+    closed(handle).await;
 }

@@ -1,6 +1,6 @@
 //! Translate the Core application input to this provider's request.
-use super::OpenAiCompatible;
-use crate::infrastructure::text::{self, bad, bounded, data_message, effort};
+use super::{OpenAiCompatible, continuation};
+use crate::infrastructure::text::{self, bounded, data_message, effort};
 use furica_core::{Error, Result, text_model::*};
 use serde_json::{Value, json};
 
@@ -18,19 +18,7 @@ impl OpenAiCompatible {
             }
             match message {
                 ModelMessage::Assistant(m) => {
-                    if m.continuation.is_some()
-                        || m.content
-                            .iter()
-                            .any(|c| matches!(c, ModelContent::ReasoningSummary(_)))
-                    {
-                        return Err(bad());
-                    }
-                    let calls: Vec<Value> = m.tool_calls().map(|c| json!({"id":c.call_id,"type":"function","function":{"name":c.name,"arguments":c.arguments.to_string()}})).collect();
-                    let mut v = json!({"role":"assistant","content":m.text()});
-                    if !calls.is_empty() {
-                        v["tool_calls"] = json!(calls);
-                    }
-                    messages.push(v);
+                    messages.push(continuation::encode(m)?);
                 }
                 ModelMessage::ToolResult { call_id, result } => messages.push(
                     json!({"role":"tool","tool_call_id":call_id,"content":result.to_string()}),

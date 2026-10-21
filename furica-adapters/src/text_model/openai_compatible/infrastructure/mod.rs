@@ -1,4 +1,5 @@
 //! Concrete implementation of Core's TextModel port.
+mod continuation;
 mod request;
 mod stream;
 use super::config::Config;
@@ -60,6 +61,6 @@ impl TextModel for OpenAiCompatible {
         cancel: CancellationToken,
     ) -> Result<ModelStream> {
         let sse = self.http.open(self.encode(&request)?, cancel).await?;
-        Ok(stream::open(sse))
+        Ok(stream::open(sse, self.http.scope.clone()))
     }
 }
