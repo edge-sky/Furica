@@ -1,12 +1,12 @@
 //! Loopback HTTP/WebSocket transport. Exactly one browser owns the device session
 //! and snapshot writer, including while the owner is shutting down.
 use crate::{
-    bootstrap::Config,
     conversation::{Command, Session, infrastructure::input::decode_audio, presentation},
+    settings::{SettingsStore, presentation as settings_view},
 };
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
     Request, Response, StatusCode, body::Incoming, server::conn::http1, service::service_fn,
 };
@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 type HostResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type Body = Full<Bytes>;
 
-pub async fn serve(config: Arc<Config>, port: u16) -> HostResult<()> {
+pub async fn serve(config: Arc<SettingsStore>, port: u16) -> HostResult<()> {
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
     let port = listener.local_addr()?.port();
     println!(
@@ -84,7 +84,7 @@ fn allowed_host(host: &str, port: u16) -> bool {
 
 async fn http(
     mut request: Request<Incoming>,
-    config: Arc<Config>,
+    config: Arc<SettingsStore>,
     busy: Arc<AtomicBool>,
     stop: CancellationToken,
     port: u16,
@@ -100,6 +100,10 @@ async fn http(
             "text/plain",
             "Loopback host required",
         ));
+    }
+    if request.uri().path() == "/api/settings" {
+        let host = host.to_owned();
+        return Ok(settings_http(request, config, host).await);
     }
     if request.method() != hyper::Method::GET {
         return Ok(response(
@@ -194,6 +198,10 @@ async fn http(
             "text/javascript; charset=utf-8",
             include_str!("../../web/sessions/panel.js"),
         ),
+        "/settings/panel.js" => (
+            "text/javascript; charset=utf-8",
+            include_str!("../../web/settings/panel.js"),
+        ),
         "/diagnostics.js" => (
             "text/javascript; charset=utf-8",
             include_str!("../../web/diagnostics.js"),
@@ -208,6 +216,101 @@ async fn http(
         _ => return Ok(response(StatusCode::NOT_FOUND, "text/plain", "Not found")),
     };
     Ok(response(StatusCode::OK, kind, body))
+}
+
+async fn settings_http(
+    request: Request<Incoming>,
+    store: Arc<SettingsStore>,
+    host: String,
+) -> Response<Body> {
+    let reading = request.method() == hyper::Method::GET;
+    let result = match *request.method() {
+        hyper::Method::GET => store.read().await,
+        hyper::Method::PUT => {
+            let expected = format!("http://{host}");
+            if request
+                .headers()
+                .get("origin")
+                .and_then(|v| v.to_str().ok())
+                != Some(expected.as_str())
+            {
+                return response(
+                    StatusCode::FORBIDDEN,
+                    "application/json",
+                    r#"{"error":"仅允许同源页面保存设置"}"#,
+                );
+            }
+            if request
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.split(';').next().unwrap_or("").trim())
+                != Some("application/json")
+            {
+                return response(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "application/json",
+                    r#"{"error":"需要 JSON 设置"}"#,
+                );
+            }
+            let bytes = match tokio::time::timeout(
+                Duration::from_secs(5),
+                Limited::new(request.into_body(), 64 * 1024).collect(),
+            )
+            .await
+            {
+                Ok(Ok(body)) => body.to_bytes(),
+                Ok(Err(_)) => {
+                    return response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "application/json",
+                        r#"{"error":"设置不能超过 64 KiB"}"#,
+                    );
+                }
+                Err(_) => {
+                    return response(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "application/json",
+                        r#"{"error":"读取设置超时"}"#,
+                    );
+                }
+            };
+            let value = match serde_json::from_slice::<Value>(&bytes) {
+                Ok(value) => value,
+                Err(_) => {
+                    return response(
+                        StatusCode::BAD_REQUEST,
+                        "application/json",
+                        r#"{"error":"设置 JSON 格式无效"}"#,
+                    );
+                }
+            };
+            store.write(value).await
+        }
+        _ => {
+            return response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "application/json",
+                r#"{"error":"仅支持 GET 和 PUT"}"#,
+            );
+        }
+    };
+    match result {
+        Ok(config) => response(
+            StatusCode::OK,
+            "application/json",
+            settings_view::response(&config).to_string(),
+        ),
+        Err(error) => response(
+            if reading {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            "application/json",
+            json!({"error":error.to_string()}).to_string(),
+        ),
+    }
 }
 
 struct Lease(Arc<AtomicBool>);
@@ -231,7 +334,7 @@ where
 
 async fn connection<S>(
     mut socket: WebSocketStream<S>,
-    config: Arc<Config>,
+    config: Arc<SettingsStore>,
     stop: CancellationToken,
 ) -> HostResult<()>
 where
@@ -239,7 +342,7 @@ where
 {
     let mut session: Option<Session> = None;
     let result=async {
-        send(&mut socket,config.public_status()).await?;
+        send(&mut socket,config.read().await?.public_status()).await?;
         match crate::sessions::SnapshotStore::configured().load() {
             Ok(data) => send(&mut socket, crate::sessions::snapshot(data)).await?,
             Err(error) => send(&mut socket, json!({"type":"save_error","message":error.to_string()})).await?,
@@ -268,7 +371,11 @@ where
                             match command {
                                 Command::Start {mode,speaker,session_id}=>{
                                     if session.is_some(){send(&mut socket,json!({"type":"error","message":"请先停止当前内核"})).await?;continue;}
-                                    match Session::start(&config,mode,&speaker,session_id).await {
+                                    let latest = match config.read().await {
+                                        Ok(latest) => latest,
+                                        Err(_) => {send(&mut socket,json!({"type":"start_error","message":"无法读取服务设置"})).await?;continue;}
+                                    };
+                                    match Session::start(&latest,mode,&speaker,session_id).await {
                                         Ok(started)=>{
                                             send(&mut socket,json!({"type":"started","state":presentation::state(started.core.state()),"session_id":started.session_id})).await?;
                                             send(&mut socket,crate::sessions::snapshot(started.manager.snapshot()?)).await?;

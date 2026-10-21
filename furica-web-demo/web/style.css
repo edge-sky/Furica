@@ -40,3 +40,17 @@ body.panel-open .main-space { margin-right: 340px; padding-right: 32px; padding-
 .composing .artwork { width: min(290px, 55vw); margin: -10px auto 10px; }.composing .welcome-copy { display: none; }
 
 .history-empty { white-space: pre-line; }.more-button { padding: 0; letter-spacing: 0; }
+
+/* Editable service configuration follows the existing settings panel. */
+.service-section input:not([type="checkbox"]), .service-section select, .service-section textarea { width: 100%; box-sizing: border-box; background: #fffaf2; border: 1px solid #e0d8c7; border-radius: 8px; padding: 10px 12px; color: var(--ink); font: inherit; }
+.service-section textarea { resize: vertical; min-height: 65px; }
+.service-section input:focus, .service-section textarea:focus, .service-section select:focus { outline: 2px solid #929f84; outline-offset: 2px; }
+.clear-key { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+.settings-feedback { margin: 12px 0; font-size: 12px; line-height: 1.8; color: var(--muted); overflow-wrap: anywhere; }
+.settings-feedback.error { color: #a34d3d; }
+.settings-actions { display: flex; gap: 10px; align-items: center; }
+.primary-button:disabled { opacity: .55; cursor: wait; }
+
+@media (max-width: 480px) { .settings-dialog .settings-body { max-height: 48dvh; } .settings-footer { gap: 8px; } .settings-actions { gap: 4px; flex-shrink: 0; } .settings-actions .primary-button { padding: 10px 16px; } }
+
+.required-marker { margin-left: 8px; font-size: 10px; color: #a3654d; font-weight: 500; }
