@@ -7,7 +7,7 @@ use furica_core::{
     input::{SpeakerDecision, SpeakerVerifier, Vad, VadActivity},
     orchestration::{CoreHandle, CoreState},
 };
-use furica_vad::{FRAME_SAMPLES, SileroVad};
+use furica_local::{FRAME_SAMPLES, SileroVad};
 use std::{
     collections::VecDeque,
     sync::{

@@ -7,7 +7,7 @@ export class Diagnostics {
     document.querySelector('#clear-events').onclick = () => { this.entries = []; this.render(); };
   }
   add(event) {
-    if (event.type === 'audio' || event.type === 'ack') return;
+    if (['audio', 'ack', 'session_snapshot'].includes(event.type)) return;
     this.entries.push({ time: new Date().toLocaleTimeString('zh-CN', { hour12: false }), event });
     if (this.entries.length > 500) this.entries.shift();
     this.render();
@@ -18,7 +18,7 @@ export class Diagnostics {
     for (const { time, event } of this.entries) {
       const isError = event.type.includes('error') || event.kind === 'error';
       const filter = this.filter.value;
-      if (filter === 'error' && !isError || filter === 'task' && !event.type.startsWith('task') || filter === 'state' && !['state', 'started', 'stopped', 'kernel_stopped', 'playback_state', 'speaker'].includes(event.type)) continue;
+      if (filter === 'error' && !isError || filter === 'task' && event.type !== 'execution_changed' || filter === 'state' && !['state', 'started', 'stopped', 'kernel_stopped', 'playback_state', 'speaker'].includes(event.type)) continue;
       const row = document.createElement('div'); row.className = `log-row${isError ? ' error' : ''}`;
       const timestamp = document.createElement('span'); timestamp.textContent = time;
       const kind = document.createElement('span'); kind.className = 'log-kind'; kind.textContent = event.type + (event.kind ? ` / ${event.kind}` : '');

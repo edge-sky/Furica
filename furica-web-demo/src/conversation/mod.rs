@@ -2,6 +2,7 @@ pub mod infrastructure;
 pub mod presentation;
 
 use crate::bootstrap::{Config, SAMPLE_RATE, resolve_path};
+use crate::sessions::SnapshotStore;
 use furica_core::{
     Error, Result,
     audio::AudioFrame,
@@ -9,17 +10,18 @@ use furica_core::{
     input::{InputConfig, SpeechInput},
     orchestration::{Core, CoreEvent, CoreHandle, CoreOutput, VoicePipeline},
     playback::PlaybackPosition,
-    tasks::{TaskAnswer, TaskManager, infrastructure::sqlite::TaskStore},
+    sessions::SessionManager,
 };
-use furica_vad::{SileroVad, VadConfig};
+use furica_local::{SileroVad, VadConfig};
 use infrastructure::input::{PreparedVad, TestSpeaker};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 use tokio::{
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, watch},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -28,6 +30,8 @@ pub enum Command {
     Start {
         mode: Mode,
         speaker: String,
+        #[serde(default)]
+        session_id: Option<Uuid>,
     },
     Text {
         text: String,
@@ -49,20 +53,6 @@ pub enum Command {
         played_ms: u32,
     },
     Snapshot,
-    ContinueTask {
-        session_id: Uuid,
-        prompt: String,
-    },
-    AnswerQuestion {
-        question_id: Uuid,
-        answer: TaskAnswer,
-    },
-    CancelTask {
-        session_id: Uuid,
-    },
-    CloseTask {
-        session_id: Uuid,
-    },
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq)]
@@ -77,8 +67,13 @@ pub struct Session {
     pub output: CoreOutput,
     pub events: broadcast::Receiver<CoreEvent>,
     pub errors: mpsc::Receiver<String>,
-    pub tasks: TaskManager,
-    pub store: Arc<TaskStore>,
+    pub manager: SessionManager,
+    pub session_id: Uuid,
+    store: Arc<SnapshotStore>,
+    changes: watch::Receiver<u64>,
+    save_errors: mpsc::Receiver<Value>,
+    saver: Option<JoinHandle<()>>,
+    save_cancel: CancellationToken,
     pub capture: Option<mpsc::Sender<AudioFrame>>,
     pub speaker: Arc<TestSpeaker>,
     worker: Option<JoinHandle<()>>,
@@ -87,7 +82,12 @@ pub struct Session {
 }
 
 impl Session {
-    pub async fn start(config: &Config, mode: Mode, decision: &str) -> Result<Self> {
+    pub async fn start(
+        config: &Config,
+        mode: Mode,
+        decision: &str,
+        selected: Option<Uuid>,
+    ) -> Result<Self> {
         let missing = config.missing(mode == Mode::Voice);
         if !missing.is_empty() {
             return Err(Error::Config(format!("请填写配置：{}", missing.join(", "))));
@@ -107,7 +107,19 @@ impl Session {
         } else {
             None
         };
-        let (pipeline, tasks, store) = config.compose()?;
+        let (pipeline, manager, store) = config.compose()?;
+        // Subscribe before mutations and saving; coalesced notifications cannot
+        // lose work prepared while the previous snapshot is written.
+        let changes = manager.changes();
+        let save_changes = manager.changes();
+        let session_id = match selected {
+            Some(id) => {
+                manager.session(id)?;
+                id
+            }
+            None => manager.create_session()?.id,
+        };
+        crate::sessions::save(&manager, &store, true).await?;
         let speaker = Arc::new(TestSpeaker::default());
         speaker.set(decision)?;
         let decisions = Arc::new(PreparedVad::default());
@@ -124,10 +136,11 @@ impl Session {
                     config: InputConfig::default(),
                 },
                 VoicePipeline::Cascaded(pipeline),
-                tasks.clone(),
+                manager.clone(),
+                session_id,
             )?
         } else {
-            Core::start(core_config, Arc::new(pipeline), tasks.clone())?
+            Core::start(core_config, Arc::new(pipeline), manager.clone(), session_id)?
         };
         let events = core.subscribe();
         let (error_tx, errors) = mpsc::channel(1);
@@ -143,13 +156,27 @@ impl Session {
         } else {
             (None, None)
         };
+        let save_cancel = CancellationToken::new();
+        let (save_error_tx, save_errors) = mpsc::channel(1);
+        let saver = Some(tokio::spawn(crate::sessions::autosave(
+            manager.clone(),
+            store.clone(),
+            save_changes,
+            save_cancel.clone(),
+            save_error_tx,
+        )));
         let session = Self {
             core,
             output,
             events,
             errors,
-            tasks,
+            manager,
+            session_id,
             store,
+            changes,
+            save_errors,
+            saver,
+            save_cancel,
             capture,
             speaker,
             worker,
@@ -208,16 +235,7 @@ impl Session {
                     .await?;
                 Value::Null
             }
-            Command::Snapshot => return crate::tasks::snapshot(&self.store),
-            Command::ContinueTask { session_id, prompt } => {
-                crate::tasks::continue_run(&self.tasks, session_id, prompt)?
-            }
-            Command::AnswerQuestion {
-                question_id,
-                answer,
-            } => crate::tasks::answer(&self.tasks, question_id, answer)?,
-            Command::CancelTask { session_id } => crate::tasks::cancel(&self.tasks, session_id)?,
-            Command::CloseTask { session_id } => crate::tasks::close(&self.tasks, session_id)?,
+            Command::Snapshot => return Ok(crate::sessions::snapshot(self.manager.snapshot()?)),
             Command::Start { .. } | Command::Stop => {
                 return Err(Error::State("invalid session command".into()));
             }
@@ -228,6 +246,15 @@ impl Session {
     pub async fn next(&mut self) -> Value {
         loop {
             tokio::select! {
+                changed = self.changes.changed() => {
+                    if changed.is_ok() {
+                        return match self.manager.snapshot() {
+                            Ok(data) => crate::sessions::snapshot(data),
+                            Err(error) => json!({"type":"error", "message":error.to_string()}),
+                        };
+                    }
+                }
+                Some(event) = self.save_errors.recv() => return event,
                 changed = self.output.playback.changed() => {
                     if changed.is_ok() { return presentation::playback(*self.output.playback.borrow_and_update()); }
                 }
@@ -236,7 +263,7 @@ impl Session {
                     Ok(event) => return presentation::event(event),
                     Err(broadcast::error::RecvError::Lagged(count)) => return json!({"type":"resync", "lost":count,
                         "state":presentation::state(self.core.state()), "playback":presentation::playback(*self.output.playback.borrow()),
-                        "tasks":crate::tasks::snapshot(&self.store).ok()}),
+                        "sessions":self.manager.snapshot().ok().map(crate::sessions::snapshot)}),
                     Err(broadcast::error::RecvError::Closed) => (),
                 },
                 Some(audio) = self.output.audio.recv() => {
@@ -265,23 +292,63 @@ impl Session {
                     result.map_err(|_| Error::State("capture worker failed".into()))
                 });
         }
-        if self.runner_done {
-            return worker_result;
+        let mut result = Ok(());
+        if !self.runner_done {
+            result = self.core.shutdown().await;
+            let runner = (&mut self.output.runner)
+                .await
+                .unwrap_or_else(|_| Err(Error::State("core runner failed".into())));
+            self.runner_done = true;
+            result = result.and(runner);
         }
-        let result = self.core.shutdown().await;
-        let runner = (&mut self.output.runner)
-            .await
-            .map_err(|_| Error::State("core runner failed".into()))?;
-        self.runner_done = true;
-        result.and(runner).and(worker_result)
+        // Also await executor cleanup if the Core runner failed before its
+        // normal shutdown path, then persist the resulting terminal records.
+        let execution = self.manager.shutdown(Duration::from_secs(10)).await;
+        self.save_cancel.cancel();
+        if let Some(saver) = self.saver.take() {
+            let _ = saver.await;
+        }
+        let saved = crate::sessions::save(&self.manager, &self.store, false).await;
+        result.and(execution).and(worker_result).and(saved)
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
         self.capture.take();
-        // Connection errors and normal closure call stop() and await TaskManager.
+        self.save_cancel.cancel();
+        if let Some(saver) = self.saver.take() {
+            saver.abort();
+        }
+        // Normal closure calls stop(), awaits Core and flushes the final snapshot.
         // This fallback also releases the Core actor if startup is abandoned.
         self.output.runner.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn websocket_controls_resume_business_sessions_and_reject_old_acp_commands() {
+        let id = Uuid::new_v4();
+        let command: Command = serde_json::from_value(
+            json!({"type":"start", "mode":"text", "speaker":"accepted", "session_id":id}),
+        )
+        .unwrap();
+        assert!(
+            matches!(command, Command::Start { session_id: Some(selected), .. } if selected == id)
+        );
+        for kind in [
+            "continue_task",
+            "answer_question",
+            "cancel_task",
+            "close_task",
+        ] {
+            assert!(
+                serde_json::from_value::<Command>(json!({"type":kind, "session_id":id})).is_err()
+            );
+        }
     }
 }

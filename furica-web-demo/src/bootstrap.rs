@@ -1,5 +1,6 @@
 //! Host configuration and composition root. No configuration is sent to the browser.
 use furica_adapters::{
+    acp::{AcpConfig, AcpExecutor},
     aliyun,
     text_model::{anthropic, openai_compatible, openai_responses},
     volcengine,
@@ -7,14 +8,8 @@ use furica_adapters::{
 use furica_core::{
     Error, Result,
     orchestration::{CascadeConfig, CascadedBackend},
+    sessions::{SessionLimits, SessionManager},
     stt::Stt,
-    tasks::{
-        TaskLimits, TaskManager,
-        infrastructure::{
-            acp::{AcpConfig, AcpExecutor},
-            sqlite::TaskStore,
-        },
-    },
     text_model::TextModel,
     tts::Tts,
 };
@@ -144,12 +139,18 @@ impl Config {
     }
 
     pub fn public_status(&self) -> Value {
-        json!({"type":"configuration", "sample_rate":SAMPLE_RATE,
+        json!({"type":"configuration", "sample_rate":SAMPLE_RATE, "model":self.text_model.model,
             "text_missing":self.missing(false), "voice_missing":self.missing(true),
             "speaker_verifier":"测试校验器；不验证真实身份"})
     }
 
-    pub fn compose(&self) -> Result<(CascadedBackend, TaskManager, Arc<TaskStore>)> {
+    pub fn compose(
+        &self,
+    ) -> Result<(
+        CascadedBackend,
+        SessionManager,
+        Arc<crate::sessions::SnapshotStore>,
+    )> {
         let missing = self.missing(false);
         if !missing.is_empty() {
             return Err(Error::Config(format!(
@@ -220,8 +221,11 @@ impl Config {
         let cascade = CascadedBackend::new(
             CascadeConfig {
                 sample_rate: SAMPLE_RATE,
-                instructions: (!self.instructions.trim().is_empty())
-                    .then(|| self.instructions.clone()),
+                instructions: Some(if self.instructions.trim().is_empty() {
+                    "你是 Furica，一位安静、可靠的工作伙伴。简洁回答用户。需要发声时调用 speak 工具，普通回复文本用于显示。".into()
+                } else {
+                    self.instructions.clone()
+                }),
                 ..Default::default()
             },
             stt,
@@ -231,16 +235,12 @@ impl Config {
         let mut agent = AcpConfig::new(&self.acp.command);
         agent.args = self.acp.args.clone();
         agent.auth_method = self.acp.auth_method.clone();
-        let runtime = std::env::var_os("FURICA_DEMO_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| Path::new(HOST_ROOT).join("runtime"));
-        std::fs::create_dir_all(&runtime)?;
-        let store = Arc::new(TaskStore::open(runtime.join("tasks.sqlite"))?);
-        let manager = TaskManager::new(
-            store.clone(),
+        let store = Arc::new(crate::sessions::SnapshotStore::configured());
+        let manager = SessionManager::new(
+            store.load()?,
             Arc::new(AcpExecutor::new(agent)?),
             self.acp.workspace.clone().into(),
-            TaskLimits::default(),
+            SessionLimits::default(),
         )?;
         Ok((cascade, manager, store))
     }

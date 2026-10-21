@@ -4,3 +4,6 @@
 *.sqlite3-wal
 .env
 /furica-local/model/sensevoice-small.int8.onnx
+/furica-web-demo/target/
+/furica-web-demo/runtime/
+/furica-web-demo/config.json
