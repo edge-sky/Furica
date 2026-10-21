@@ -7,7 +7,7 @@ mod ports;
 
 pub use application::{
     CascadeConfig, CascadedBackend, Core, CoreEvent, CoreHandle, CoreOutput, VoiceChannels,
-    VoicePipeline, VoiceSession, task_tools,
+    VoicePipeline, VoiceSession, execution_tools,
 };
 pub use domain::CoreState;
 pub use ports::{VoiceBackend, VoiceCommand, VoiceEvent};

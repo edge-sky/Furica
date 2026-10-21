@@ -21,13 +21,16 @@ pub enum VoiceCommand {
         activity: SpeechActivity,
     },
     Text(String),
-    TaskUpdate(Value),
+    ExecutionUpdate(Value),
     /// Restore bounded task metadata without requesting an unsolicited response.
-    TaskContext(Value),
+    ExecutionContext(Value),
     ToolResult {
         call_id: String,
         result: Value,
     },
+    /// Host-confirmed progress for the current audio item. A queued speech
+    /// request remains active until all of its delivered audio has played.
+    Playback(PlaybackPosition),
     Interrupt {
         playback: Option<PlaybackPosition>,
         cancel_response: bool,
@@ -65,5 +68,9 @@ pub enum VoiceEvent {
 #[async_trait]
 pub trait VoiceBackend: Send + Sync {
     fn sample_rate(&self) -> u32;
-    async fn connect(&self) -> Result<VoiceSession>;
+    async fn connect(
+        &self,
+        sessions: crate::sessions::SessionManager,
+        session_id: uuid::Uuid,
+    ) -> Result<VoiceSession>;
 }

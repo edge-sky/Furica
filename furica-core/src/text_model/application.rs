@@ -27,7 +27,7 @@ fn valid_call(call: &ToolCall) -> bool {
         && call.arguments.is_object()
 }
 
-fn validate_request(
+pub(crate) fn validate_request(
     request: &ModelRequest,
     source: &str,
     max_messages: usize,

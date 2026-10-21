@@ -1,8 +1,8 @@
 //! Application notifications combining conversation, input and task results.
 
-use crate::{input::SpeakerDecision, orchestration::domain::CoreState, tasks::TaskEvent};
+use crate::{input::SpeakerDecision, orchestration::domain::CoreState, sessions::SessionEvent};
 
-// Task payloads are low-frequency; keeping the public variant unboxed keeps the
+// Execution payloads are low-frequency; keeping the public variant unboxed keeps the
 // host event shape stable.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
@@ -13,7 +13,7 @@ pub enum CoreEvent {
         text: String,
         final_chunk: bool,
     },
-    Task(TaskEvent),
+    Execution(SessionEvent),
     ClearPlayback,
     Speaker(SpeakerDecision),
     Error(String),

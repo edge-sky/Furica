@@ -35,6 +35,9 @@ impl AliyunStt {
 
 #[async_trait]
 impl Stt for AliyunStt {
+    fn source(&self) -> Option<&str> {
+        Some(&self.config.model)
+    }
     async fn transcribe(&self, utterance: Utterance, cancel: CancellationToken) -> Result<String> {
         cancellable(&cancel, async {
             let audio = speech::wav_base64(utterance)?;

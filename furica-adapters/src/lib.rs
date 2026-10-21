@@ -19,3 +19,6 @@ pub mod volcengine;
     feature = "anthropic"
 ))]
 pub mod text_model;
+
+#[cfg(feature = "acp")]
+pub mod acp;
