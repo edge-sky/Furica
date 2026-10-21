@@ -1,8 +1,8 @@
 pub mod infrastructure;
 pub mod presentation;
 
-use crate::bootstrap::{Config, SAMPLE_RATE, resolve_path};
 use crate::sessions::SnapshotStore;
+use crate::{bootstrap::SAMPLE_RATE, settings::Config};
 use furica_core::{
     Error, Result,
     audio::AudioFrame,
@@ -93,7 +93,7 @@ impl Session {
             return Err(Error::Config(format!("请填写配置：{}", missing.join(", "))));
         }
         let model = if mode == Mode::Voice {
-            let path = resolve_path(&config.vad_model_path);
+            let path = config.vad_model_file();
             Some(
                 tokio::task::spawn_blocking(move || {
                     SileroVad::from_file(path, VadConfig::default())
@@ -107,7 +107,7 @@ impl Session {
         } else {
             None
         };
-        let (pipeline, manager, store) = config.compose()?;
+        let (pipeline, manager, store) = config.compose().await?;
         // Subscribe before mutations and saving; coalesced notifications cannot
         // lose work prepared while the previous snapshot is written.
         let changes = manager.changes();

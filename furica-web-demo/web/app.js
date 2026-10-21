@@ -1,6 +1,7 @@
 import { AudioBridge } from '/conversation/audio.js';
 import { SessionPanel, element, icon } from '/sessions/panel.js';
 import { Diagnostics } from '/diagnostics.js';
+import { SettingsPanel } from '/settings/panel.js';
 
 const $ = selector => document.querySelector(selector);
 const labels = { standby: '随时可以开始', verifying: '正在听你说', connecting: '正在为你连接', active: '我在，慢慢说', muted: '已暂停聆听', stopped: '轻触，说点什么' };
@@ -9,8 +10,9 @@ let selected = null, activeSession = null, activeMode = null, pendingText = null
 let requestSequence = 0;
 let data = { sessions: [], messages: [], acp_sessions: [], runs: [], questions: [], tool_calls: [] };
 const diagnostics = new Diagnostics();
+const serviceSettings = new SettingsPanel(status => { configuration = status; update(); });
 function notice(message) { $('#notice-text').textContent = message; $('#notice').hidden = !message; }
-function settings() { $('#settings-dialog').showModal(); $('#conversation-menu').hidden = true; }
+function settings() { if ($('#settings-dialog').open) return; $('#settings-dialog').showModal(); $('#conversation-menu').hidden = true; void serviceSettings.open(); }
 function send(command) {
   if (socket?.readyState !== WebSocket.OPEN) throw new Error('连接已断开，重新连接后再试试。');
   socket.send(JSON.stringify(command));
