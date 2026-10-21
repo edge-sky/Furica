@@ -87,15 +87,16 @@ Anthropic 的 `version` 默认 `2023-06-01`。对确认支持的模型，可分�
 事件发布块增量。整个响应分别要求 `[DONE]`、response.completed/incomplete 或
 message_stop；单独的块结束或 EOF 不构成成功。
 
-每条完整响应复用 `AssistantMessage` 进入历史。Responses 和 Anthropic 的续接材料
+每条完整响应复用 `AssistantMessage` 进入历史。Chat、Responses 和 Anthropic 的续接材料
 带稳定来源标识，覆盖协议、完整端点、模型、账号/租户隔离标识与相关配置。
 同配置重建适配器可复用；换服务、模型、隔离范围或解释配置时须重新验证。
+Chat 同时兼容 `reasoning_content`：空字符串与 null 占位不会报错，非空片段交付为既有 `ReasoningSummary`，不会合并到普通回复或 TTS。包含该字段的原始 assistant 消息保存于既有 `ModelContinuation`，工具结果后及跨用户轮次按原样回传思考内容与工具参数字符串。回传时校验端点/模型/账号来源，以及正文、思考内容与工具调用的公开投影；被修改或缺少原始续接材料的思考消息会在发请求前拒绝。
 回传 native items/blocks 时校验公开投影并避免重复编码；公开摘要不能替代加密材料或签名。
 TaskContext/TaskUpdate 只编码为 user 数据。Core 不解释续接内容，不把摘要或载荷播报。
 
 文本本地上限（不是供应商上限）：编码前请求载荷合计 1 MiB、最多 4096 条消息及 4096 个历史内容块；请求线协议 JSON 1 MiB；单 HTTP 数据块 1 MiB；
 SSE 单行/单事件 data 256 KiB；整次 HTTP 流 16 MiB；Responses/Anthropic 原生保留材料
-1 MiB；Chat 工具参数缓冲 1 MiB / 4096 个非空片段。协议 item/block 索引小于 256。
+1 MiB；Chat 正文、思考与工具参数缓冲合计 1 MiB / 最多 4096 个非空工具参数片段，完整原始 assistant JSON 同样不超过 1 MiB。协议 item/block 索引小于 256。
 Core 另以调用方提供的合计上下文字节预算限制消息、声明、指令、公开输出和续接材料，
 最多 256 个公开内容块、32 个工具调用。所有流按消费速度读取，无后台生产任务。
 首个错误即释放流，截断结果不执行工具、不自动续写或提交成功 assistant 历史。
