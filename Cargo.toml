@@ -1,3 +1,3 @@
 [workspace]
-members = ["furica-core", "furica-local", "furica-adapters"]
+members = ["furica-core", "furica-local", "furica-adapters", "furica-host"]
 resolver = "3"
