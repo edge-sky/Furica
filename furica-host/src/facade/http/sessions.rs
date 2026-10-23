@@ -1,6 +1,6 @@
 use crate::{
     Error, Host, Result,
-    sessions::application::{message_view, page},
+    facade::http::projection::{message_view, page},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};

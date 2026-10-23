@@ -1,5 +1,5 @@
-use super::{VoiceLease, gone};
-use crate::{Error, Host, Result, interaction::application::HostState};
+use super::{HostState, VoiceLease, voice_lease::gone};
+use crate::{Error, Host, Result};
 use furica_core::{
     audio::AudioFrame,
     playback::{PlaybackChunk, PlaybackPosition, PlaybackState},
@@ -58,7 +58,7 @@ impl Host {
             .store(true, Ordering::Release);
         let (tx, rx) = mpsc::channel(self.config.limits.channel_capacity);
         let lease = VoiceLease::new(session_id, owner, rx);
-        let response = json!({"channel_id":lease.id,"voice_token":lease.token,"session_id":session_id,"sample_rate":16000,"channels":1,"encoding":"pcm_s16le","next_sequence":0,"heartbeat_interval_ms":5000,"heartbeat_timeout_ms":self.config.limits.heartbeat_timeout_ms});
+        let response = json!({"channel_id":lease.id,"voice_token":lease.token,"session_id":lease.session_id,"sample_rate":16000,"channels":1,"encoding":"pcm_s16le","next_sequence":0,"heartbeat_interval_ms":5000,"heartbeat_timeout_ms":self.config.limits.heartbeat_timeout_ms});
         *self.delivery.lock().map_err(|_| Error::conflict())? =
             Some((lease.id, tx, lease.cancelled.clone()));
         state.voice = Some(lease);
@@ -74,7 +74,7 @@ impl Host {
         state.voice.as_mut().expect("initialized lease").last_seen = Instant::now();
         Ok(response)
     }
-    pub(crate) async fn close_voice_locked(
+    pub(super) async fn close_voice_locked(
         &self,
         state: &mut HostState,
         reason: &str,

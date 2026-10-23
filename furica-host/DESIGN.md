@@ -3,20 +3,27 @@
 本文件将 `docs/host-module-proposal.md` 的已确认行为收敛为可实施的对象和协议建议。
 运行与接入策略、新增对象、字段及补充限制已于本轮对话确认，用户授权按本契约实施。
 
-## 1. 改动范围与复用
+## 1. 模块职责与复用
 
-只新增 `furica-host/`，根 `Cargo.toml` 注册成员，`Cargo.lock` 更新依赖。
-不修改 `furica-core`、`furica-adapters`、`furica-local` 的源码、测试、公开接口或行为。
-沿用方案中的 DDD 目录；只在需要独立规则时提取 domain，不创建通用仓储、插件框架或新的业务 Session。
+Host 直接复用 Core 的 Session、Message、AcpSession、Run、ToolCall、Question、SessionData，
+不修改 Core、adapters 或 local 的业务行为，不增加第二套业务实体。
 
-业务对象直接复用 Core 的 Session、Message、AcpSession、Run、ToolCall、Question、SessionData；
+- facade/http：HTTP 路由、鉴权、请求解析、响应投影、SSE 及音频传输编码。
+- facade/application：Shell 用例、运行实例生命周期、会话切换、语音通道与持久化协调。
+- configuration：配置定义、校验及 Core/适配器配置转换。
+- infrastructure/sqlite：共用数据库连接策略与版本迁移，分别实现配置及会话快照读写。
+- infrastructure/audio、model_policy：保留必要的 VAD 和模型调用策略适配。
+- bootstrap：组件装配、目录独占锁、启动加载。
+
+复用现有 Host、HostState、Runtime 和 SnapshotStore。HostState/Runtime 及其字段限制在 facade 应用层内；
+bootstrap 通过方法移交目录锁。切换会话与归档当前会话共用清理和重建流程，保留原来的串行边界。
 HTTP 投影排除模型原始 continuation。PlaybackPosition、PlaybackChunk 和 SpeechActivity 复用 Core 语义。
 
 ## 2. 配置对象
 
 启动参数仅指定数据目录和可选初始化配置 JSON 路径，不在命令行传递凭证。
 进程在读取或保存快照前，通过 `.host.lock.sqlite3` 的排他事务独占数据目录，防止重复启动覆盖正在使用的数据；退出自动释放锁。
-数据目录内使用 `configuration.sqlite3` 和 `sessions.json`。
+配置和会话快照共同存入 `configuration.sqlite3`；旧 `sessions.json` 仅作为一次性迁移来源并保留。
 首次启动必须提供初始化配置；数据库存在时从数据库加载，拒绝用初始化文件隐式覆盖。
 
 `HostConfig` 由以下部分组成；JSON 字段为 snake_case，拒绝未知字段，时间字段统一使用整数毫秒：
@@ -42,11 +49,16 @@ VAD 首期直接使用已有 VadConfig 默认值，不新增外部调参对象�
 不提供模型、云端地址、账号或 ACP 命令的隐式猜测值；选中的必需配置缺失即报错。
 只有选中的能力在启动时加载凭证及本地模型；本地 ONNX 推理不在 HTTP 或 Core ingress actor 运行。
 
-SQLite 使用 `PRAGMA user_version` 维护迁移版本，首版仅有单行配置表：
-`host_configuration(id INTEGER PRIMARY KEY CHECK(id=1), document TEXT NOT NULL)`。
-普通运行/ACP 超时时间限制为 1 ms 至 24 小时；语音和重试使用前述更小边界。访问令牌至少 32 字节。
-配置 JSON 的结构版本由数据库版本负责，不为 SessionData 再增加持久化包装对象。
-初始化、迁移和配置更新在事务内完成；不接受高于当前支持版本的数据库。
+SQLite 使用 `PRAGMA user_version` 维护迁移版本，当前版本为 3：
+
+- `host_configuration(key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)`：沿用按字段存储，key 为点分路径，value 为 JSON 值。
+- `session_snapshot(id INTEGER PRIMARY KEY CHECK(id=1), document TEXT NOT NULL)`：单行完整 SessionData JSON 快照。
+
+版本 1 配置文档先转换为按字段存储；版本 1/2 升级时创建快照表。初始化、迁移与配置更新均使用事务；高于版本 3 拒绝打开。
+配置读取仅对缺失字段使用既有默认值，不写回默认值。整份配置事务替换，避免协议切换遗留字段。
+快照沿用 Core 数据结构，不增加业务包装对象。配置与快照分别提交，互不覆盖。
+数据库连接使用 synchronous=FULL 和有界 busy timeout。数据目录锁仍保存在独立的锁库中。
+
 配置更新先验证结构和静态边界，再提交；报告 `restart_required=true`，不热应用。
 配置中仅保存凭证环境变量名；访问令牌与供应商密钥不写数据库、事件或日志。
 
@@ -117,7 +129,7 @@ header 为 `AudioEnvelope { channel_id, generation, item_id, content_index, samp
 | 对象/职责 | 保留数据与状态 |
 | --- | --- |
 | 配置存储 | SQLite 路径/连接；只负责迁移及配置事务，不依赖 HTTP handler |
-| 快照存储与保存协调 | 目标路径、64 MiB 上限、变更订阅、串行保存锁、最后保存结果、重试计数。每次捕获一份 SessionData，写入成功后仅 acknowledge_saved 该份快照 |
+| 快照存储与保存协调 | SQLite 路径、64 MiB 上限、变更订阅、串行保存锁、最后保存结果、重试计数。先加锁再捕获 SessionData，事务提交成功后仅 acknowledge_saved 该份快照 |
 | Host 运行协调 | 当前 SessionManager、已选 Session UUID、可空 CoreHandle/CoreOutput、运行 epoch、组件工厂、停止信号。切换及启停互斥，业务会话和 HTTP 连接不共享生命周期 |
 | 文字策略适配器 | 原 TextModel 引用、共享的文字/语音模式标记；单次调用锁定模式，文字模式删除请求 tools 中的 speak，拒绝供应商流中任何不在本次允许集的 ToolStart；保持原 continuation_source，不修改历史、原始续接或工具结果 |
 | 语音通道协调 | `Closed` / `Opening` / `Open` / `Closing`；通道 UUID、随机 owner token、业务会话 UUID、owner、最后心跳、期望批次号、上一已接受批次原始字节、当前失败批次及重试次数/起点、单消费者下载占用、取消令牌。整个 Host 只保留一份占用 |
@@ -161,8 +173,14 @@ SpeechStarted 触发 Core 现有打断时，组合适配器先等待并转发该
 确认后先在新模块中验证公开接口组合，再实现完整 HTTP 闭环。
 测试使用现有 trait 的测试替身；必要的替身私有状态限定为输入记录、预设事件、取消和故障注入，
 不新增业务模型。回环 HTTP 测试覆盖访问校验、文字任务闭环、并发占用、去重/背压、播放版本、失联和退出。
-存储测试覆盖 SQLite 迁移/事务、原子快照、保存失败不确认及同快照确认。
+存储测试覆盖配置版本迁移、旧 JSON 导入、数据库优先、事务回滚、大小限制、保存失败不确认及同快照确认。
 VAD 测试覆盖跨上传边界、回溯起止、打断顺序、取消和状态重置；真实 Silero 能力验证单独执行。
-原子文件保存采用同目录临时文件、文件同步、rename 和目录同步；失败时停止执行确认，重试有界并交付存储故障。
+会话保存使用 SQLite 事务替换当前快照；提交前失败不确认，重试有界并交付存储故障。
+保存工作持有串行锁直至提交和 Core 确认结束，即使调用方取消也不会让旧保存覆盖新保存。
+提交成功后的 Core 确认错误返回 snapshot_acknowledgement_failed，不声称数据库已回滚。
+
+启动优先读取数据库快照；仅无记录时读取、校验并事务导入 sessions.json，没有旧文件则提交空快照。
+导入失败保留旧文件并停止启动，后续可重试；成功后保留旧文件但停止写入。
+数据库记录存在时不读取旧文件，数据库损坏时不自动回退。恢复沿用 Core 中断未完成任务、取消待回答问题的规则。
 退出先停止接入、关闭语音、清理 Core/ACP，再保存最终快照，退出结果反映持久化和清理失败。
-最后检查只有新模块与根清单/锁文件发生本次修改；模型效果、云端账号和真实设备时延不由协议测试替代。
+本轮重构限定于 furica-host 的源码、测试及文档；模型效果、云端账号和真实设备时延不由协议测试替代。

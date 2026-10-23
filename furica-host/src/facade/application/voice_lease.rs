@@ -1,4 +1,4 @@
-mod coordination;
+use crate::facade::constant_eq;
 use crate::{Error, Result};
 use furica_core::playback::PlaybackChunk;
 use std::time::Duration;
@@ -6,10 +6,12 @@ use tokio::{sync::mpsc, time::Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-pub struct VoiceLease {
+pub(super) struct VoiceLease {
     pub id: Uuid,
     pub token: String,
     pub session_id: Uuid,
+    // Retained for debugging a live channel; not an authorization credential.
+    #[expect(dead_code)]
     pub owner: String,
     pub last_seen: Instant,
     pub next_sequence: u64,
@@ -123,12 +125,4 @@ impl VoiceLease {
 
 pub fn gone() -> Error {
     Error::new(410, "voice_closed", "voice channel is no longer active")
-}
-
-pub fn constant_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut difference = a.len() ^ b.len();
-    for i in 0..a.len().max(b.len()) {
-        difference |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0));
-    }
-    difference == 0
 }

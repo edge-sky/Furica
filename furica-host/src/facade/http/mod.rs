@@ -1,12 +1,11 @@
+mod interaction;
+mod projection;
+mod sessions;
+mod voice;
+
 use crate::{
-    Error, Host, Result,
-    configuration::{application::HostConfig, infrastructure::sqlite::ConfigStore},
-    interaction::infrastructure::http::{SelectSession, TextInput},
-    sessions::infrastructure::http as sessions,
-    voice::{
-        application::constant_eq,
-        infrastructure::http::{OpenVoice, PlaybackReport, encode},
-    },
+    Error, Host, Result, configuration::application::HostConfig, facade::constant_eq,
+    infrastructure::sqlite::ConfigStore,
 };
 use bytes::Bytes;
 use furica_core::playback::{PlaybackChunk, PlaybackState};
@@ -19,6 +18,7 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
+use interaction::{SelectSession, TextInput};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::{convert::Infallible, future::Future, net::SocketAddr, sync::Arc, time::Duration};
@@ -29,6 +29,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use voice::{OpenVoice, PlaybackReport, encode};
 
 type Body = UnsyncBoxBody<Bytes, Infallible>;
 type HttpResponse = Response<Body>;

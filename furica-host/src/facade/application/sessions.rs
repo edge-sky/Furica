@@ -1,4 +1,3 @@
-use super::switching_allowed;
 use crate::{Error, Host, Result};
 use furica_core::sessions::{SessionData, SessionManager};
 use uuid::Uuid;
@@ -7,36 +6,10 @@ impl Host {
         let mut state = self.state.lock().await;
         self.usable(&state)?;
         if state.selected == Some(id) {
-            if state.voice.is_some() || !switching_allowed(&state.manager)? {
-                return Err(Error::conflict());
-            }
-            if let Some(runtime) = &state.runtime {
-                runtime.handle.end_conversation().await?;
-            }
-            if !switching_allowed(&state.manager)? {
-                return Err(Error::conflict());
-            }
-            state.ready = false;
-            self.stop_saver(&mut state).await;
-            let stopped = self.stop_runtime(&mut state).await;
-            let saved = self.persist(&state.manager).await;
-            if stopped.is_err() || saved.is_err() {
-                state.ready = false;
-                return Err(Error::new(
-                    503,
-                    "archive_failed",
-                    "runtime cleanup or save failed",
-                ));
-            }
-            let data = state.manager.snapshot()?;
-            state.manager = SessionManager::new(
-                data,
-                self.components.executor.clone(),
-                self.config.workspace.clone(),
-                self.config.session_limits(),
-            )?;
-            state.selected = None;
-            self.start_saver(&mut state);
+            self.prepare_replacement(&mut state).await?;
+            self.rebuild_sessions(&mut state)
+                .await
+                .map_err(|_| Error::new(503, "archive_failed", "runtime cleanup or save failed"))?;
         }
         let session = state.manager.archive_session(id)?;
         self.persist(&state.manager).await?;
@@ -73,4 +46,13 @@ impl Host {
                 .unwrap_or("Standby".into()),
         ))
     }
+}
+
+pub(super) fn switching_allowed(manager: &SessionManager) -> Result<bool> {
+    let data = manager.snapshot()?;
+    Ok(!data.runs.iter().any(|r| !r.state.is_terminal())
+        && !data
+            .questions
+            .iter()
+            .any(|q| q.state == furica_core::sessions::QuestionState::Pending))
 }

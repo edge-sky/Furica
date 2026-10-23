@@ -1,6 +1,4 @@
-mod coordination;
-use crate::Result;
-use furica_core::sessions::{Message, MessageContent, SessionManager};
+use furica_core::sessions::{Message, MessageContent};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -46,13 +44,4 @@ pub fn message_view(message: &Message) -> Value {
     json!({"id":message.id,"session_id":message.session_id,"acp_session_id":message.acp_session_id,
         "run_id":message.run_id,"sequence":message.sequence,"role":message.role,"source":message.source,
         "state":message.state,"created_at_ms":message.created_at_ms,"updated_at_ms":message.updated_at_ms,"content":content})
-}
-
-pub fn switching_allowed(manager: &SessionManager) -> Result<bool> {
-    let data = manager.snapshot()?;
-    Ok(!data.runs.iter().any(|r| !r.state.is_terminal())
-        && !data
-            .questions
-            .iter()
-            .any(|q| q.state == furica_core::sessions::QuestionState::Pending))
 }

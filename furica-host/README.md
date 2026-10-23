@@ -18,12 +18,17 @@ cargo run -p furica-host -- /absolute/path/to/host-data --initialize /absolute/p
 
 后续启动省略 `--initialize`，从 SQLite 读取配置；已有配置时携带初始化文件会被拒绝。
 访问令牌至少 32 字节，所有凭证仅从配置引用的环境变量读取。
-Host 为数据目录设置 Unix 0700 权限；快照临时文件使用 0600。
-数据目录包含 `configuration.sqlite3` 和 `sessions.json`，不能作为网站静态目录公开。
+Host 为数据目录设置 Unix 0700 权限。
+`configuration.sqlite3` 同时保存配置与会话快照，不能作为网站静态目录公开。
 进程通过 `.host.lock.sqlite3` 的排他锁独占数据目录，第二个进程在读取/保存快照前被拒绝，进程退出自动释放。
 Ctrl-C / SIGTERM 会停止接入、释放语音、等待 Core/ACP 清理并保存最终快照；失败以非零状态退出。
 
 `GET/PUT /configuration` 查询/事务保存下次启动配置，返回 `saved` 和 `restart_required`。
+配置表 `host_configuration(key, value)` 按字段存储：key 使用点分路径（如 `model.endpoint`），
+value 使用 JSON 编码，数组作为一个值保存。读取缺失字段时使用代码中已有的默认值，
+读取操作不将默认值写回数据库；非法值或缺失必要字段仍报配置错误。
+整份配置保存采用事务替换，因此切换协议不会遗留旧协议字段。
+数据库版本 1 的整份 JSON 配置会在启动时事务转换为 k-v 表；版本 1/2 均升级至版本 3，新增会话快照表。
 修改数据库不热更新当前组件、凭证、监听地址或 CORS 名单。
 启动时校验配置、加载选中能力和本地文件；云端连接/账号是否有效仍需真实调用验证。
 
@@ -115,15 +120,28 @@ Host 不操作设备、不重采样，不伪造完成反馈。
 
 ## 保存与限制
 
-配置使用 SQLite 事务与数据库迁移版本；未知未来版本拒绝打开。
-会话存储直接序列化 Core SessionData，默认上限 64 MiB。
-保存采用同目录临时文件、文件同步、rename、目录同步；只确认刚刚保存的同一份快照。
-写盘失败不确认 Prepared Run，标记未就绪，自动重试至多三次并推送故障。
-部署需使用支持上述原子替换/目录同步的本地文件系统；当前已在本机 macOS 上验证。
+配置和会话快照统一使用 SQLite 事务与数据库迁移版本；未知未来版本拒绝打开。
+会话表 `session_snapshot(id, document)` 只保存 id=1 的当前快照，document 为完整 Core SessionData JSON，默认上限 64 MiB。
+保存先取得串行锁再捕获快照，事务提交成功后仅 acknowledge_saved 该份快照；取消调用方不会释放尚在提交的保存锁。
+写盘失败不确认 Prepared Run，标记未就绪，每轮最多尝试三次并推送故障。
+提交后的 Core 确认失败单独报告 `snapshot_acknowledgement_failed`，已提交的数据不会回滚。
+SQLite 使用 `synchronous=FULL`；配置更新与会话保存分别提交，互不覆盖对方数据。
+
+启动先读取数据库快照；仅当快照记录不存在时，校验并事务导入旧 `sessions.json`，缺失旧文件则保存空快照。
+导入失败停止启动，修复后可重试。旧文件保留但不再写入；数据库记录一旦存在便是唯一恢复来源。
+数据库快照损坏时明确报错，不回退到旧文件。恢复继续使用 Core 的中断/取消规则，不重放旧任务副作用。
 
 会话查询和保存需要通过 Core 完整快照接口复制数据；适合首期本机数据规模。
 不支持多个业务会话同时运行、运行配置热更新、可靠 SSE 日志、音频断点续传或设备控制。
 SSE 滞后/重连后查询最新状态；不要把 SSE 当作持久事件日志。
+
+## 代码职责
+
+`facade/http` 负责 HTTP、鉴权、响应投影与音频编码；`facade/application` 负责 Shell 用例及 Core 生命周期协调。
+共享运行状态只在 facade 应用层内部访问，切换与归档复用清理和重建流程。
+`infrastructure/sqlite` 统一负责配置及快照读写；`infrastructure/audio` 和 `model_policy` 保留必要的能力适配。
+`configuration` 定义并校验配置，`bootstrap` 负责组装、数据目录锁及启动恢复。
+不再单独建立 Host 的 interaction、sessions、voice 领域包装模块；公开 HTTP 路径保持兼容。
 
 ## 验证
 
