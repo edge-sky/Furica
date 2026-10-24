@@ -21,7 +21,7 @@ impl Memory {
         if incoming_bytes > MAX_MESSAGE_BYTES {
             return Err(Error::Busy("ACP message content"));
         }
-        self.change(|data| {
+        self.change(|data, events| {
             let acp=data.acp_sessions.iter().find(|session|session.id==acp_id)
                 .cloned().ok_or_else(||missing(acp_id))?;
             let candidate=if let Some(id)=&source_id {
@@ -58,12 +58,15 @@ impl Memory {
                     if !merged { blocks.push(content); }
                 }
                 message.updated_at_ms=now_ms();
+                events.push(SessionEvent::MessageRecorded(message.clone()));
                 touch(data,acp.session_id);
             } else {
                 push_message(data,acp.session_id,Some(acp_id),run_id,source_id,role,
                     MessageSource::Agent{agent_id:acp.agent_id},MessageContent::Blocks(vec![content]),MessageState::Streaming)?;
+                events.push(SessionEvent::MessageRecorded(data.messages.last().expect("appended message").clone()));
             }
-            if let Some(session)=data.acp_sessions.iter_mut().find(|session|session.id==acp_id) { session.touch(); }
+            if let Some(session)=data.acp_sessions.iter_mut().find(|session|session.id==acp_id) { session.touch(); events.push(SessionEvent::AcpSessionChanged(session.clone())); }
+            super::state::emit_owner(data, acp.session_id, events);
             Ok(())
         })
     }
@@ -82,7 +85,8 @@ impl Memory {
         content: Option<Vec<Value>>,
         locations: Option<Vec<Value>>,
     ) -> Result<()> {
-        self.change(|d| {
+        self.change(|d, events| {
+            let first_message = d.messages.len();
             let owner = d
                 .acp_sessions
                 .iter()
@@ -172,6 +176,7 @@ impl Memory {
                 call.state = v;
             }
             call.updated_at_ms = now_ms();
+            events.push(SessionEvent::ToolCallRecorded(call.clone()));
             let id = call.id;
             let name = call.name.clone();
             let terminal = call.state.is_terminal();
@@ -196,7 +201,15 @@ impl Memory {
             touch(d, owner);
             if let Some(s) = d.acp_sessions.iter_mut().find(|s| s.id == acp_id) {
                 s.touch();
+                events.push(SessionEvent::AcpSessionChanged(s.clone()));
             }
+            events.extend(
+                d.messages[first_message..]
+                    .iter()
+                    .cloned()
+                    .map(SessionEvent::MessageRecorded),
+            );
+            super::state::emit_owner(d, owner, events);
             Ok(())
         })
     }

@@ -1,5 +1,5 @@
 use crate::{Error, Result, configuration::application::HostConfig};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
@@ -21,45 +21,23 @@ impl ConfigStore {
         let version: u32 = tx
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(|_| Error::storage())?;
-        if version > 3 {
+        if version != 0 && version != 4 {
             return Err(Error::new(
                 503,
                 "unsupported_database",
-                "database version is newer than this host",
+                "database schema is incompatible with this host",
             ));
         }
-        if version == 1 {
-            let document: Option<String> = tx
-                .query_row(
-                    "SELECT document FROM host_configuration WHERE id=1",
-                    [],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(|_| Error::storage())?;
-            tx.execute_batch("ALTER TABLE host_configuration RENAME TO legacy_configuration;")
-                .map_err(|_| Error::storage())?;
-            create_table(&tx)?;
-            if let Some(document) = document {
-                let config: HostConfig =
-                    serde_json::from_str(&document).map_err(|_| Error::config())?;
-                config.validate()?;
-                write_config(&tx, &config)?;
+        if version == 0 {
+            // Never reinterpret an unversioned pre-existing database as an empty one.
+            let tables: u64 = tx.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", [], |r| r.get(0)).map_err(|_| Error::storage())?;
+            if tables != 0 {
+                return Err(Error::storage());
             }
-            tx.execute_batch("DROP TABLE legacy_configuration;")
-                .map_err(|_| Error::storage())?;
-        } else if version == 0 {
             create_table(&tx)?;
-        }
-        if version < 3 {
-            tx.execute_batch(
-                "CREATE TABLE session_snapshot(
-                    id INTEGER PRIMARY KEY CHECK(id = 1),
-                    document TEXT NOT NULL
-                 );
-                 PRAGMA user_version=3;",
-            )
-            .map_err(|_| Error::storage())?;
+            super::sessions::create_tables(&tx)?;
+            tx.execute_batch("PRAGMA user_version=4;")
+                .map_err(|_| Error::storage())?;
         }
         let initialized: bool = tx
             .query_row("SELECT EXISTS(SELECT 1 FROM host_configuration)", [], |r| {
@@ -112,8 +90,7 @@ impl ConfigStore {
 
 fn create_table(db: &Connection) -> Result<()> {
     db.execute_batch(
-        "CREATE TABLE host_configuration(key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
-         PRAGMA user_version=2;",
+        "CREATE TABLE host_configuration(key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);",
     )
     .map_err(|_| Error::storage())
 }

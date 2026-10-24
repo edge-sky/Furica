@@ -1,9 +1,9 @@
-//! SQLite persistence for host configuration and Core session snapshots.
+//! SQLite persistence for host configuration and session messages.
 mod configuration;
-mod snapshot;
+mod sessions;
 
 pub use configuration::ConfigStore;
-pub use snapshot::SnapshotStore;
+pub use sessions::SessionStore;
 
 use crate::{Error, Result};
 use rusqlite::{Connection, OpenFlags};

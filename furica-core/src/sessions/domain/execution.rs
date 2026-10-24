@@ -401,8 +401,13 @@ pub struct AcpStatus {
     pub pending_questions: Vec<Question>,
 }
 
-#[derive(Clone, Debug)]
+/// Complete business messages for host organization, plus transient runtime notifications.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SessionEvent {
+    SessionChanged(super::Session),
+    MessageRecorded(super::Message),
+    ToolCallRecorded(super::ToolCall),
+    QuestionChanged(Question),
     AcpSessionChanged(AcpSession),
     RunChanged {
         session_id: Uuid,

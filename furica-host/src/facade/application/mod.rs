@@ -1,12 +1,12 @@
+mod delivery;
 mod interaction;
 mod lifecycle;
-mod persistence;
 mod sessions;
 mod voice;
 mod voice_lease;
 
 use crate::{
-    Error, Result, configuration::application::HostConfig, infrastructure::sqlite::SnapshotStore,
+    Error, Result, configuration::application::HostConfig, infrastructure::sqlite::SessionStore,
 };
 use furica_core::{
     orchestration::{Core, CoreEvent, CoreHandle, CoreState, VoiceBackend},
@@ -44,7 +44,8 @@ pub struct Host {
     pub config: HostConfig,
     state: Mutex<HostState>,
     components: Components,
-    store: Arc<SnapshotStore>,
+    store: Arc<SessionStore>,
+    receiver_serial: Arc<Mutex<()>>,
     delivery: Delivery,
     events: broadcast::Sender<Value>,
     storage_healthy: Arc<AtomicBool>,
@@ -59,7 +60,7 @@ struct HostState {
     runtime: Option<Runtime>,
     voice: Option<VoiceLease>,
     capture_sequence: u64,
-    saver: Option<(CancellationToken, JoinHandle<()>)>,
+    receiver: Option<(CancellationToken, JoinHandle<()>)>,
     ready: bool,
 }
 
@@ -76,25 +77,55 @@ impl Host {
     pub async fn new(
         config: HostConfig,
         components: Components,
-        data: SessionData,
         database_path: PathBuf,
     ) -> Result<Arc<Self>> {
         config.validate()?;
+        let store = Arc::new(SessionStore::new(
+            database_path,
+            config.limits.context_max_bytes,
+        ));
+        let receiver_serial = Arc::new(Mutex::new(()));
+        let ids = tokio::task::spawn_blocking({
+            let store = store.clone();
+            move || store.session_ids()
+        })
+        .await
+        .map_err(|_| Error::storage())??;
+        // Normalize host-loaded contexts before serving requests. Old work is never replayed.
+        for id in ids {
+            let data = tokio::task::spawn_blocking({
+                let store = store.clone();
+                move || store.context(id)
+            })
+            .await
+            .map_err(|_| Error::storage())??;
+            let manager = SessionManager::new(
+                data,
+                components.executor.clone(),
+                config.workspace.clone(),
+                config.session_limits(),
+            )?;
+            delivery::receive(&manager, store.clone(), receiver_serial.clone()).await?;
+            tokio::task::spawn_blocking({
+                let store = store.clone();
+                let stream = manager.delivery_id();
+                move || store.finish_delivery(stream)
+            })
+            .await
+            .map_err(|_| Error::storage())??;
+        }
         let manager = SessionManager::new(
-            data,
+            SessionData::default(),
             components.executor.clone(),
             config.workspace.clone(),
             config.session_limits(),
         )?;
-        let store = Arc::new(SnapshotStore::new(
-            database_path,
-            config.limits.snapshot_max_bytes,
-        ));
         let (events, _) = broadcast::channel(config.limits.channel_capacity);
         let host = Arc::new(Self {
             config,
             components,
             store,
+            receiver_serial,
             delivery: Arc::new(StdMutex::new(None)),
             events,
             storage_healthy: Arc::new(AtomicBool::new(true)),
@@ -107,13 +138,13 @@ impl Host {
                 runtime: None,
                 voice: None,
                 capture_sequence: 0,
-                saver: None,
+                receiver: None,
                 ready: true,
             }),
         });
         {
             let mut state = host.state.lock().await;
-            host.start_saver(&mut state);
+            host.start_receiver(&mut state);
         }
         let weak = Arc::downgrade(&host);
         let lifetime = host.lifetime.clone();
@@ -206,7 +237,7 @@ impl Drop for Host {
     fn drop(&mut self) {
         self.lifetime.cancel();
         let state = self.state.get_mut();
-        if let Some((cancel, task)) = state.saver.take() {
+        if let Some((cancel, task)) = state.receiver.take() {
             cancel.cancel();
             task.abort();
         }

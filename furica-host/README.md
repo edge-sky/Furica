@@ -19,16 +19,16 @@ cargo run -p furica-host -- /absolute/path/to/host-data --initialize /absolute/p
 后续启动省略 `--initialize`，从 SQLite 读取配置；已有配置时携带初始化文件会被拒绝。
 访问令牌至少 32 字节，所有凭证仅从配置引用的环境变量读取。
 Host 为数据目录设置 Unix 0700 权限。
-`configuration.sqlite3` 同时保存配置与会话快照，不能作为网站静态目录公开。
-进程通过 `.host.lock.sqlite3` 的排他锁独占数据目录，第二个进程在读取/保存快照前被拒绝，进程退出自动释放。
-Ctrl-C / SIGTERM 会停止接入、释放语音、等待 Core/ACP 清理并保存最终快照；失败以非零状态退出。
+`configuration.sqlite3` 同时保存配置与会话记录，不能作为网站静态目录公开。
+进程通过 `.host.lock.sqlite3` 的排他锁独占数据目录，第二个进程在访问数据库前被拒绝，进程退出自动释放。
+Ctrl-C / SIGTERM 会停止接入、释放语音、等待 Core/ACP 清理并接收并提交剩余消息；失败以非零状态退出。
 
 `GET/PUT /configuration` 查询/事务保存下次启动配置，返回 `saved` 和 `restart_required`。
 配置表 `host_configuration(key, value)` 按字段存储：key 使用点分路径（如 `model.endpoint`），
 value 使用 JSON 编码，数组作为一个值保存。读取缺失字段时使用代码中已有的默认值，
 读取操作不将默认值写回数据库；非法值或缺失必要字段仍报配置错误。
 整份配置保存采用事务替换，因此切换协议不会遗留旧协议字段。
-数据库版本 1 的整份 JSON 配置会在启动时事务转换为 k-v 表；版本 1/2 均升级至版本 3，新增会话快照表。
+数据库版本为 4，只支持新建空数据库或打开版本 4；旧版本直接拒绝，不提供迁移或旧 JSON 导入。
 修改数据库不热更新当前组件、凭证、监听地址或 CORS 名单。
 启动时校验配置、加载选中能力和本地文件；云端连接/账号是否有效仍需真实调用验证。
 
@@ -74,7 +74,7 @@ curl -H "Authorization: Bearer $FURICA_HOST_TOKEN" -H 'Content-Type: application
 | `POST /voice/{id}/playback` | 实际播放位置 |
 
 分页查询使用 `offset`、`limit`，默认 50、上限 200；响应 `{items,offset,limit,total}`。
-每次分页基于一致快照；不同请求间数据可能变化。
+每次分页在同一数据库读事务内取得条目和总数；不同请求间数据可能变化。
 错误为 `{code,message,retryable}`，不会透传供应商响应或凭证。
 本机应用需自行持续运行进程；Host 不安装系统服务。
 
@@ -120,26 +120,33 @@ Host 不操作设备、不重采样，不伪造完成反馈。
 
 ## 保存与限制
 
-配置和会话快照统一使用 SQLite 事务与数据库迁移版本；未知未来版本拒绝打开。
-会话表 `session_snapshot(id, document)` 只保存 id=1 的当前快照，document 为完整 Core SessionData JSON，默认上限 64 MiB。
-保存先取得串行锁再捕获快照，事务提交成功后仅 acknowledge_saved 该份快照；取消调用方不会释放尚在提交的保存锁。
-写盘失败不确认 Prepared Run，标记未就绪，每轮最多尝试三次并推送故障。
-提交后的 Core 确认失败单独报告 `snapshot_acknowledgement_failed`，已提交的数据不会回滚。
-SQLite 使用 `synchronous=FULL`；配置更新与会话保存分别提交，互不覆盖对方数据。
+Host 独占数据库连接、结构、读写、事务和历史查询。Core 不接收仓储接口。
+SQLite 按 `sessions`、`messages`、`acp_sessions`、`runs`、`tool_calls`、`questions`
+分别组织记录；`received_messages` 保存每个运行消息流最后一组的序号和内容。
+Core 的完整记录与接收凭据在同一事务提交，再调用 `acknowledge_messages(sequence)`。
+相同序号和内容可重复提交，冲突或断序会拒绝。接收工作持有串行锁直到提交及确认结束，
+调用方取消不会释放尚在工作的锁。Prepared Run 在提交前不会启动。
+写盘失败保留 Core 待交付数据，标记未就绪，每轮最多尝试三次并推送故障；可通过 `flush` 重试。
+提交后确认失败返回 `message_acknowledgement_failed`，已提交记录不会回滚。
+SQLite 使用 `synchronous=FULL`；配置事务与会话消息事务独立。
 
-启动先读取数据库快照；仅当快照记录不存在时，校验并事务导入旧 `sessions.json`，缺失旧文件则保存空快照。
-导入失败停止启动，修复后可重试。旧文件保留但不再写入；数据库记录一旦存在便是唯一恢复来源。
-数据库快照损坏时明确报错，不回退到旧文件。恢复继续使用 Core 的中断/取消规则，不重放旧任务副作用。
+Host 启动时逐会话加载并归一化历史；未完成执行中断、问题取消，不重放副作用。
+选择会话时仅从数据库加载目标会话的完整 `SessionData`，由 Core 留在内存供运行使用。
+`context_max_bytes` 限制单会话导入的记录内容，默认 64 MiB；模型请求仍受独立的 `max_context_bytes` 限制。
+历史列表直接从数据库分页读取，查询前接收当前 Core 已产生的待交付消息。
+不再在每次变更时复制、序列化或覆盖全部会话快照。
 
-会话查询和保存需要通过 Core 完整快照接口复制数据；适合首期本机数据规模。
-不支持多个业务会话同时运行、运行配置热更新、可靠 SSE 日志、音频断点续传或设备控制。
-SSE 滞后/重连后查询最新状态；不要把 SSE 当作持久事件日志。
+可靠交付覆盖当前进程内的有序接收、失败重试和事务去重。Core 未交付队列保存在内存，
+进程异常退出前尚未提交的输出不能恢复；已提交记录恢复时不会自动重放 ACP 副作用。
+音频沿用 `PlaybackChunk` 和实际播放反馈，不新增音频存档或断点续传。
+不支持多个业务会话同时运行、运行配置热更新、可靠 SSE 日志或设备控制。
+SSE 滞后/重连后查询最新状态。
 
 ## 代码职责
 
 `facade/http` 负责 HTTP、鉴权、响应投影与音频编码；`facade/application` 负责 Shell 用例及 Core 生命周期协调。
 共享运行状态只在 facade 应用层内部访问，切换与归档复用清理和重建流程。
-`infrastructure/sqlite` 统一负责配置及快照读写；`infrastructure/audio` 和 `model_policy` 保留必要的能力适配。
+`infrastructure/sqlite` 统一负责配置及会话记录读写；`infrastructure/audio` 和 `model_policy` 保留必要的能力适配。
 `configuration` 定义并校验配置，`bootstrap` 负责组装、数据目录锁及启动恢复。
 不再单独建立 Host 的 interaction、sessions、voice 领域包装模块；公开 HTTP 路径保持兼容。
 

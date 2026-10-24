@@ -8,7 +8,7 @@ impl Host {
         explicit: bool,
     ) -> Result<()> {
         self.usable(state)?;
-        let session = state.manager.session(id)?;
+        let session = self.database(move |store| store.session(id)).await?;
         if session.state != furica_core::sessions::SessionState::Active {
             return Err(Error::conflict());
         }
@@ -22,6 +22,16 @@ impl Host {
             self.prepare_replacement(state).await?;
             self.rebuild_sessions(state).await?;
         }
+        self.stop_receiver(state).await;
+        let data = self.database(move |store| store.context(id)).await?;
+        state.manager = SessionManager::new(
+            data,
+            self.components.executor.clone(),
+            self.config.workspace.clone(),
+            self.config.session_limits(),
+        )?;
+        self.receive_messages(&state.manager).await?;
+        self.start_receiver(state);
         let started = self.start_runtime(state, id);
         if started.is_ok() {
             state.ready = true;

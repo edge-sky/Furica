@@ -1,6 +1,6 @@
 //! SessionManager coordinates ACP sessions, serial rounds and agent questions.
 //!
-//! The host manages business sessions, saves snapshots and reads execution state.
+//! The host manages business sessions, receives business messages and reads execution state.
 //! Only the main-model workflow can prepare and control ACP work.
 
 use std::{
@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::super::domain::{
-    Message, MessageContent, MessageRole, MessageSource, MessageState, Session,
+    Message, MessageContent, MessageRole, MessageSource, MessageState, Session, SessionState,
 };
 use super::super::{
     domain::{
@@ -49,7 +49,7 @@ impl Default for SessionLimits {
     }
 }
 
-/// Host-facing session data, save acknowledgement and read-only ACP status.
+/// Host-facing session context, message acknowledgement and read-only ACP status.
 /// ACP commands are reserved for the main-model workflow.
 ///
 /// ```compile_fail
@@ -72,6 +72,8 @@ pub struct SessionManager(Arc<Inner>);
 
 struct Inner {
     data: Memory,
+    delivery_id: Uuid,
+    acknowledgements: Mutex<()>,
     executor: Arc<dyn Executor>,
     workspace: PathBuf,
     limits: SessionLimits,
@@ -127,6 +129,8 @@ impl SessionManager {
         let (events, _) = broadcast::channel(128);
         Ok(Self(Arc::new(Inner {
             data,
+            delivery_id: Uuid::new_v4(),
+            acknowledgements: Mutex::new(()),
             executor,
             workspace,
             limits,
@@ -139,26 +143,51 @@ impl SessionManager {
         })))
     }
 
+    #[cfg(test)]
     pub fn snapshot(&self) -> Result<SessionData> {
         self.0.data.snapshot()
     }
-    /// Confirm that the host successfully saved this exact snapshot. Core starts
-    /// only model-prepared runs contained in it, in their original preparation
-    /// order. Repeated acknowledgements do not repeat accepted work, and work
-    /// prepared during a save waits for its own acknowledgement.
-    ///
-    /// Call inside a Tokio runtime when the snapshot contains prepared work.
-    /// This confirms the host's save; it does not perform or verify storage I/O.
-    pub fn acknowledge_saved(&self, snapshot: &SessionData) -> Result<()> {
-        for run in self.0.data.saved_prepared_runs(snapshot)? {
-            self.launch(run.session_id, run.id)?;
-        }
-        Ok(())
+
+    /// Identity of this runtime's ordered host message stream.
+    pub fn delivery_id(&self) -> Uuid {
+        self.0.delivery_id
     }
-    /// Subscribe before reading a snapshot. Notifications coalesce; reread the
-    /// full snapshot after every change. This stream does not acknowledge saving.
-    pub fn changes(&self) -> watch::Receiver<u64> {
+    /// The oldest unacknowledged group. Reading never removes it.
+    pub fn pending_messages(&self) -> Result<Option<(u64, Vec<SessionEvent>)>> {
+        self.0.data.pending_messages()
+    }
+    /// Confirm host receipt of one group. Core does not perform storage I/O.
+    /// Prepared tasks in the confirmed group may now be scheduled, once only.
+    /// Call inside a Tokio runtime when the group contains prepared work.
+    pub fn acknowledge_messages(&self, sequence: u64) -> Result<()> {
+        let _serial = self
+            .0
+            .acknowledgements
+            .lock()
+            .map_err(|_| Error::State("acknowledgement lock poisoned".into()))?;
+        // Retain the group if scheduling fails so the same acknowledgement can be retried.
+        if let Some((pending, events)) = self.0.data.pending_messages()?
+            && pending == sequence
+        {
+            for event in events {
+                if let SessionEvent::RunChanged { run, .. } = event
+                    && run.state == RunState::Prepared
+                    && !self.0.shutdown.is_cancelled()
+                    && self.0.data.get_run(run.id)?.state == RunState::Prepared
+                    && self.session(run.session_id)?.state == SessionState::Active
+                {
+                    self.launch(run.session_id, run.id)?;
+                }
+            }
+        }
+        self.0.data.acknowledge_messages(sequence)
+    }
+    /// A wake-up hint only. Drain pending_messages; this notification may coalesce.
+    pub fn messages_available(&self) -> watch::Receiver<u64> {
         self.0.data.subscribe()
+    }
+    pub fn switching_allowed(&self) -> Result<bool> {
+        self.0.data.switching_allowed()
     }
     pub fn create_session(&self) -> Result<Session> {
         let s = Session::new();
@@ -237,8 +266,8 @@ impl SessionManager {
             .any(|question| question.session_id == session_id))
     }
 
-    /// Main-model tool entry point. Only prepare data; the host must save and
-    /// acknowledge a snapshot containing this run before Core starts execution.
+    /// Main-model tool entry point. Only prepare data; the host must receive and
+    /// acknowledge its ordered messages before Core starts execution.
     pub(crate) fn prepare_start(
         &self,
         session_id: Uuid,
@@ -278,7 +307,7 @@ impl SessionManager {
             last_activity_ms: now,
             error: None,
         };
-        let run = self.0.data.change(|d| {
+        let run = self.0.data.change(|d, events| {
             require_active(d, session_id)?;
             if d.acp_sessions
                 .iter()
@@ -292,7 +321,16 @@ impl SessionManager {
                 return Err(Error::Busy("execution rounds"));
             }
             let run = prepare_input(d, &acp, &key, &prompt)?;
+            events.push(SessionEvent::MessageRecorded(
+                d.messages.last().expect("prepared input").clone(),
+            ));
+            events.push(SessionEvent::RunChanged {
+                session_id,
+                run: run.clone(),
+            });
+            super::state::emit_owner(d, session_id, events);
             d.acp_sessions.push(acp.clone());
+            events.push(SessionEvent::AcpSessionChanged(acp.clone()));
             d.runs.push(run.clone());
             Ok(run)
         })?;
@@ -341,12 +379,20 @@ impl SessionManager {
                 "ACP session does not accept new rounds".into(),
             ));
         }
-        let run = self.0.data.change(|d| {
+        let run = self.0.data.change(|d, events| {
             require_active(d, session_id)?;
             if d.runs.iter().filter(|r| !r.state.is_terminal()).count() >= self.0.limits.max_runs {
                 return Err(Error::Busy("execution rounds"));
             }
             let run = prepare_input(d, &acp, &key, &prompt)?;
+            events.push(SessionEvent::MessageRecorded(
+                d.messages.last().expect("prepared input").clone(),
+            ));
+            events.push(SessionEvent::RunChanged {
+                session_id,
+                run: run.clone(),
+            });
+            super::state::emit_owner(d, session_id, events);
             d.runs.push(run.clone());
             Ok(run)
         })?;
@@ -357,7 +403,7 @@ impl SessionManager {
         Ok(run)
     }
 
-    /// Schedule model-prepared work after a successful host save acknowledgement.
+    /// Schedule model-prepared work after host message acknowledgement.
     /// Calling it again never repeats an accepted execution.
     fn launch(&self, session_id: Uuid, run_id: Uuid) -> Result<Run> {
         let runtime = tokio::runtime::Handle::try_current()
@@ -666,13 +712,17 @@ impl SessionManager {
     }
     fn cancel_prepared(&self, owner: Option<Uuid>, acp: Option<Uuid>) -> Result<()> {
         let connections = self.lock_connections()?;
-        self.0.data.change(|d| {
+        self.0.data.change(|d, events| {
             for r in &mut d.runs {
                 if r.state == RunState::Prepared
                     && owner.is_none_or(|id| id == r.session_id)
                     && acp.is_none_or(|id| id == r.acp_session_id)
                 {
                     r.cancel_before_start("not_launched");
+                    events.push(SessionEvent::RunChanged {
+                        session_id: r.session_id,
+                        run: r.clone(),
+                    });
                 }
             }
             for s in &mut d.acp_sessions {
@@ -685,6 +735,7 @@ impl SessionManager {
                         .any(|r| r.acp_session_id == s.id && !r.state.is_terminal())
                 {
                     s.closed();
+                    events.push(SessionEvent::AcpSessionChanged(s.clone()));
                 }
             }
             Ok(())
@@ -902,14 +953,7 @@ impl SessionManager {
         let tool_call_id = self
             .0
             .data
-            .snapshot()?
-            .tool_calls
-            .iter()
-            .find(|t| {
-                t.run_id == Some(draft.run_id)
-                    && Some(&t.source_call_id) == draft.source_tool_call_id.as_ref()
-            })
-            .map(|t| t.id);
+            .source_tool(draft.run_id, draft.source_tool_call_id.as_deref())?;
         let question = Question {
             id: draft.id,
             tool_call_id,

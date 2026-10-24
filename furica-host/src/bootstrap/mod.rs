@@ -1,11 +1,7 @@
 use crate::{
     Components, Error, Host, Result,
     configuration::application::{HostConfig, ModelConfig, SttConfig, TtsConfig},
-    infrastructure::{
-        audio::VadBackend,
-        model_policy::SpeechPolicy,
-        sqlite::{ConfigStore, SnapshotStore},
-    },
+    infrastructure::{audio::VadBackend, model_policy::SpeechPolicy, sqlite::ConfigStore},
 };
 use async_trait::async_trait;
 use furica_adapters::{
@@ -68,7 +64,7 @@ pub async fn start(
             .join(data_dir)
     };
     prepare_directory(&data_dir)?;
-    // Acquire before reading or saving snapshots. A second process must not
+    // Acquire before accessing the session database. A second process must not
     // overwrite the live host's data while discovering that its port is busy.
     let directory_lock = tokio::task::spawn_blocking({
         let path = data_dir.join(".host.lock.sqlite3");
@@ -119,15 +115,7 @@ pub async fn start(
     }
     let components = assemble(&config).await?;
     let path = data_dir.join("configuration.sqlite3");
-    let legacy = data_dir.join("sessions.json");
-    let limit = config.limits.snapshot_max_bytes;
-    let data = tokio::task::spawn_blocking({
-        let path = path.clone();
-        move || SnapshotStore::new(path, limit).load_or_import(&legacy)
-    })
-    .await
-    .map_err(|_| Error::storage())??;
-    let host = Host::new(config, components, data, path).await?;
+    let host = Host::new(config, components, path).await?;
     host.hold_directory_lock(directory_lock).await;
     if let Err(error) = host.flush().await {
         let _ = host.shutdown().await;

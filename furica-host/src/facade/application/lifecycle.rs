@@ -18,19 +18,21 @@ impl Host {
 
     pub(super) async fn rebuild_sessions(&self, state: &mut HostState) -> Result<()> {
         state.ready = false;
-        self.stop_saver(state).await;
+        self.stop_receiver(state).await;
         let stopped = self.stop_runtime(state).await;
-        let saved = self.persist(&state.manager).await;
+        let saved = self.receive_messages(&state.manager).await;
         stopped.and(saved)?;
+        let stream = state.manager.delivery_id();
+        self.database(move |store| store.finish_delivery(stream))
+            .await?;
         state.manager = SessionManager::new(
-            state.manager.snapshot()?,
+            SessionData::default(),
             self.components.executor.clone(),
             self.config.workspace.clone(),
             self.config.session_limits(),
         )?;
         state.selected = None;
         state.capture_sequence = 0;
-        self.start_saver(state);
         Ok(())
     }
 
@@ -192,8 +194,11 @@ impl Host {
         } else {
             Ok(())
         };
-        self.stop_saver(&mut state).await;
-        let saved = self.persist(&state.manager).await;
-        voice.and(runtime).and(manager).and(saved)
+        self.stop_receiver(&mut state).await;
+        let saved = self.receive_messages(&state.manager).await;
+        voice.and(runtime).and(manager).and(saved)?;
+        let stream = state.manager.delivery_id();
+        self.database(move |store| store.finish_delivery(stream))
+            .await
     }
 }

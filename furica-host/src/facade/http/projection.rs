@@ -1,24 +1,5 @@
 use furica_core::sessions::{Message, MessageContent};
-use serde::Serialize;
 use serde_json::{Value, json};
-
-#[derive(Serialize)]
-pub struct Page<T> {
-    pub items: Vec<T>,
-    pub offset: usize,
-    pub limit: usize,
-    pub total: usize,
-}
-
-pub fn page<T>(all: Vec<T>, offset: usize, limit: usize) -> Page<T> {
-    let total = all.len();
-    Page {
-        items: all.into_iter().skip(offset).take(limit).collect(),
-        offset,
-        limit,
-        total,
-    }
-}
 
 pub fn message_view(message: &Message) -> Value {
     use furica_core::text_model::ModelMessage;

@@ -4,7 +4,7 @@ use super::data::SessionData;
 use crate::{Error, Result, text_model::ModelMessage};
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     sync::{Mutex, MutexGuard},
 };
 use tokio::sync::watch;
@@ -13,6 +13,13 @@ use uuid::Uuid;
 pub(super) struct Memory {
     data: Mutex<SessionData>,
     changes: watch::Sender<u64>,
+    // Ordered, acknowledged delivery is separate from lossy UI notifications.
+    pending: Mutex<DeliveryQueue>,
+}
+struct DeliveryQueue {
+    generated: u64,
+    acknowledged: u64,
+    groups: VecDeque<(u64, Vec<SessionEvent>)>,
 }
 impl Memory {
     pub fn new(mut data: SessionData) -> Result<Self> {
@@ -82,10 +89,21 @@ impl Memory {
                 MessageState::Complete,
             )?;
         }
-        let (changes, _) = watch::channel(0);
+        let initial = context_messages(&data);
+        let mut pending = VecDeque::new();
+        let sequence = u64::from(!initial.is_empty());
+        if sequence != 0 {
+            pending.push_back((sequence, initial));
+        }
+        let (changes, _) = watch::channel(sequence);
         Ok(Self {
             data: Mutex::new(data),
             changes,
+            pending: Mutex::new(DeliveryQueue {
+                generated: sequence,
+                acknowledged: 0,
+                groups: pending,
+            }),
         })
     }
     fn lock(&self) -> Result<MutexGuard<'_, SessionData>> {
@@ -93,72 +111,76 @@ impl Memory {
             .lock()
             .map_err(|_| Error::State("session data lock poisoned".into()))
     }
+    #[cfg(test)]
     pub fn snapshot(&self) -> Result<SessionData> {
         Ok(self.lock()?.clone())
     }
-    pub fn saved_prepared_runs(&self, saved: &SessionData) -> Result<Vec<Run>> {
-        saved.validate()?;
+    pub fn pending_messages(&self) -> Result<Option<(u64, Vec<SessionEvent>)>> {
+        Ok(self
+            .pending
+            .lock()
+            .map_err(|_| Error::State("message delivery lock poisoned".into()))?
+            .groups
+            .front()
+            .cloned())
+    }
+    pub fn acknowledge_messages(&self, sequence: u64) -> Result<()> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| Error::State("message delivery lock poisoned".into()))?;
+        if sequence <= pending.acknowledged {
+            return Ok(());
+        }
+        if pending.groups.front().map(|v| v.0) != Some(sequence) {
+            return Err(Error::State(
+                "message acknowledgement is out of order".into(),
+            ));
+        }
+        pending.groups.pop_front();
+        pending.acknowledged = sequence;
+        Ok(())
+    }
+    pub fn source_tool(&self, run_id: Uuid, source: Option<&str>) -> Result<Option<Uuid>> {
+        Ok(self
+            .lock()?
+            .tool_calls
+            .iter()
+            .find(|t| t.run_id == Some(run_id) && Some(t.source_call_id.as_str()) == source)
+            .map(|t| t.id))
+    }
+    pub fn switching_allowed(&self) -> Result<bool> {
         let data = self.lock()?;
-        let saved_runs: std::collections::HashMap<_, _> = saved
-            .runs
-            .iter()
-            .filter(|run| run.state == RunState::Prepared)
-            .map(|run| (run.id, run))
-            .collect();
-        for id in saved_runs.keys() {
-            if !data.runs.iter().any(|run| run.id == *id) {
-                return Err(missing(*id));
-            }
-        }
-        let mut ready = Vec::new();
-        // Use Core's order, not the order of a host-provided collection.
-        for run in data
-            .runs
-            .iter()
-            .filter(|run| run.state == RunState::Prepared)
-        {
-            let Some(saved_run) = saved_runs.get(&run.id) else {
-                continue;
-            };
-            let input = data.messages.iter().find(|m| m.id == run.input_message_id);
-            let saved_input = saved.messages.iter().find(|m| m.id == run.input_message_id);
-            let acp = data
-                .acp_sessions
+        Ok(!data.runs.iter().any(|r| !r.state.is_terminal())
+            && !data
+                .questions
                 .iter()
-                .find(|s| s.id == run.acp_session_id);
-            let saved_acp = saved
-                .acp_sessions
-                .iter()
-                .find(|s| s.id == run.acp_session_id);
-            // Active ACP metadata may change while a snapshot is being saved;
-            // its identity and execution configuration must remain the same.
-            let same_acp = acp.zip(saved_acp).is_some_and(|(a, b)| {
-                a.session_id == b.session_id
-                    && a.workspace == b.workspace
-                    && a.agent_id == b.agent_id
-            });
-            if serde_json::to_value(run)? != serde_json::to_value(saved_run)?
-                || serde_json::to_value(input)? != serde_json::to_value(saved_input)?
-                || !same_acp
-            {
-                return Err(Error::State(
-                    "saved execution does not match prepared data".into(),
-                ));
-            }
-            ready.push(run.clone());
-        }
-        Ok(ready)
+                .any(|q| q.state == QuestionState::Pending))
     }
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changes.subscribe()
     }
-    pub fn change<T>(&self, f: impl FnOnce(&mut SessionData) -> Result<T>) -> Result<T> {
-        let result = {
-            let mut data = self.lock()?;
-            f(&mut data)?
-        };
-        self.changes
-            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    pub fn change<T>(
+        &self,
+        f: impl FnOnce(&mut SessionData, &mut Vec<SessionEvent>) -> Result<T>,
+    ) -> Result<T> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| Error::State("message delivery lock poisoned".into()))?;
+        // Never evict unacknowledged messages. Host must continuously receive this queue.
+        let sequence = pending
+            .generated
+            .checked_add(1)
+            .ok_or_else(|| Error::State("delivery sequence exhausted".into()))?;
+        let mut data = self.lock()?;
+        let mut events = Vec::new();
+        let result = f(&mut data, &mut events)?;
+        if !events.is_empty() {
+            pending.generated = sequence;
+            pending.groups.push_back((sequence, events));
+            self.changes.send_replace(sequence);
+        }
         Ok(result)
     }
     pub fn owner(&self, id: Uuid) -> Result<Session> {
@@ -170,7 +192,7 @@ impl Memory {
             .ok_or_else(|| missing(id))
     }
     pub fn add_owner(&self, session: Session) -> Result<()> {
-        self.change(|d| {
+        self.change(|d, events| {
             if session.id.is_nil()
                 || session.name.trim().is_empty()
                 || session.name.len() > 1024
@@ -178,12 +200,13 @@ impl Memory {
             {
                 return Err(Error::Config("invalid or duplicate session".into()));
             }
+            events.push(SessionEvent::SessionChanged(session.clone()));
             d.sessions.push(session);
             Ok(())
         })
     }
     pub fn rename(&self, id: Uuid, name: String) -> Result<Session> {
-        self.change(|d| {
+        self.change(|d, events| {
             if name.trim().is_empty() || name.len() > 1024 {
                 return Err(Error::Config("invalid session name".into()));
             }
@@ -194,11 +217,12 @@ impl Memory {
                 .ok_or_else(|| missing(id))?;
             s.name = name;
             s.updated_at_ms = now_ms();
+            events.push(SessionEvent::SessionChanged(s.clone()));
             Ok(s.clone())
         })
     }
     pub fn archive(&self, id: Uuid) -> Result<Session> {
-        self.change(|d| {
+        self.change(|d, events| {
             let s = d
                 .sessions
                 .iter_mut()
@@ -206,6 +230,7 @@ impl Memory {
                 .ok_or_else(|| missing(id))?;
             s.state = SessionState::Archived;
             s.updated_at_ms = now_ms();
+            events.push(SessionEvent::SessionChanged(s.clone()));
             Ok(s.clone())
         })
     }
@@ -286,7 +311,7 @@ impl Memory {
             .collect())
     }
     pub fn update_session(&self, id: Uuid, f: impl FnOnce(&mut AcpSession)) -> Result<AcpSession> {
-        self.change(|d| {
+        self.change(|d, events| {
             let r = d
                 .acp_sessions
                 .iter_mut()
@@ -295,11 +320,13 @@ impl Memory {
             f(r);
             let result = r.clone();
             touch(d, result.session_id);
+            events.push(SessionEvent::AcpSessionChanged(result.clone()));
+            emit_owner(d, result.session_id, events);
             Ok(result)
         })
     }
     pub fn update_run(&self, id: Uuid, f: impl FnOnce(&mut Run)) -> Result<Run> {
-        self.change(|d| {
+        self.change(|d, events| {
             let r = d
                 .runs
                 .iter_mut()
@@ -309,11 +336,16 @@ impl Memory {
             r.updated_at_ms = now_ms();
             let result = r.clone();
             touch(d, result.session_id);
+            events.push(SessionEvent::RunChanged {
+                session_id: result.session_id,
+                run: result.clone(),
+            });
+            emit_owner(d, result.session_id, events);
             Ok(result)
         })
     }
     pub fn update_question(&self, id: Uuid, f: impl FnOnce(&mut Question)) -> Result<Question> {
-        self.change(|d| {
+        self.change(|d, events| {
             let r = d
                 .questions
                 .iter_mut()
@@ -322,16 +354,20 @@ impl Memory {
             f(r);
             let result = r.clone();
             touch(d, result.session_id);
+            events.push(SessionEvent::QuestionChanged(result.clone()));
+            emit_owner(d, result.session_id, events);
             Ok(result)
         })
     }
     pub fn insert_question(&self, q: &Question) -> Result<()> {
-        self.change(|d| {
+        self.change(|d, events| {
             if d.questions.iter().any(|x| x.id == q.id) {
                 return Err(Error::State("duplicate question".into()));
             }
             d.questions.push(q.clone());
+            events.push(SessionEvent::QuestionChanged(q.clone()));
             touch(d, q.session_id);
+            emit_owner(d, q.session_id, events);
             Ok(())
         })
     }
@@ -397,7 +433,7 @@ impl Memory {
         if crate::text_model::message_size(&message) > MAX_MESSAGE_BYTES {
             return Err(Error::Busy("message content"));
         }
-        self.change(|d| {
+        self.change(|d, events| {
             require_active(d, id)?;
             next_sequence(d, id)?;
             if let ModelMessage::Assistant(a) = &message {
@@ -435,6 +471,7 @@ impl Memory {
             let role = model_role(&message);
             let content = match message {
                 ModelMessage::Assistant(a) => {
+                    let first_tool = d.tool_calls.len();
                     for c in a.tool_calls() {
                         let now = now_ms();
                         d.tool_calls.push(ToolCall {
@@ -455,6 +492,12 @@ impl Memory {
                             updated_at_ms: now,
                         });
                     }
+                    events.extend(
+                        d.tool_calls[first_tool..]
+                            .iter()
+                            .cloned()
+                            .map(SessionEvent::ToolCallRecorded),
+                    );
                     MessageContent::Model(ModelMessage::Assistant(a))
                 }
                 ModelMessage::ToolResult { call_id, result } => {
@@ -478,18 +521,22 @@ impl Memory {
                     };
                     t.output = Some(result);
                     t.updated_at_ms = now_ms();
+                    events.push(SessionEvent::ToolCallRecorded(t.clone()));
                     MessageContent::ToolResult(t.id)
                 }
                 other => MessageContent::Model(other),
             };
-            push_message(d, id, None, None, None, role, source, content, state)
+            let message = push_message(d, id, None, None, None, role, source, content, state)?;
+            events.push(SessionEvent::MessageRecorded(message.clone()));
+            emit_owner(d, id, events);
+            Ok(message)
         })
     }
     pub fn set_instructions(&self, id: Uuid, text: Option<&str>) -> Result<()> {
         if text.is_some_and(|text| text.len() > MAX_MESSAGE_BYTES) {
             return Err(Error::Busy("system instructions"));
         }
-        self.change(|d| {
+        self.change(|d, events| {
             require_active(d, id)?;
             let current = d
                 .messages
@@ -514,11 +561,15 @@ impl Memory {
                 MessageContent::System(text.unwrap_or_default().to_owned()),
                 MessageState::Complete,
             )?;
+            events.push(SessionEvent::MessageRecorded(
+                d.messages.last().expect("appended message").clone(),
+            ));
+            emit_owner(d, id, events);
             Ok(())
         })
     }
     pub fn finish_messages(&self, run: Uuid, interrupted: bool) -> Result<()> {
-        self.change(|d| {
+        self.change(|d, events| {
             for m in &mut d.messages {
                 if m.run_id == Some(run) && m.state == MessageState::Streaming {
                     m.state = if interrupted {
@@ -527,12 +578,14 @@ impl Memory {
                         MessageState::Complete
                     };
                     m.updated_at_ms = now_ms();
+                    events.push(SessionEvent::MessageRecorded(m.clone()));
                 }
             }
             for t in &mut d.tool_calls {
                 if t.run_id == Some(run) && !t.state.is_terminal() {
                     t.state = ToolCallState::Interrupted;
                     t.updated_at_ms = now_ms();
+                    events.push(SessionEvent::ToolCallRecorded(t.clone()));
                 }
             }
             Ok(())
@@ -604,4 +657,51 @@ pub(super) fn next_sequence(d: &SessionData, owner: Uuid) -> Result<u64> {
         .unwrap_or(0)
         .checked_add(1)
         .ok_or_else(|| Error::State("message sequence exhausted".into()))
+}
+
+/// A host-provided context is emitted once after runtime recovery normalization.
+fn context_messages(data: &SessionData) -> Vec<SessionEvent> {
+    data.sessions
+        .iter()
+        .cloned()
+        .map(SessionEvent::SessionChanged)
+        .chain(
+            data.acp_sessions
+                .iter()
+                .cloned()
+                .map(SessionEvent::AcpSessionChanged),
+        )
+        .chain(
+            data.messages
+                .iter()
+                .cloned()
+                .map(SessionEvent::MessageRecorded),
+        )
+        .chain(
+            data.runs
+                .iter()
+                .cloned()
+                .map(|run| SessionEvent::RunChanged {
+                    session_id: run.session_id,
+                    run,
+                }),
+        )
+        .chain(
+            data.tool_calls
+                .iter()
+                .cloned()
+                .map(SessionEvent::ToolCallRecorded),
+        )
+        .chain(
+            data.questions
+                .iter()
+                .cloned()
+                .map(SessionEvent::QuestionChanged),
+        )
+        .collect()
+}
+pub(super) fn emit_owner(data: &SessionData, id: Uuid, events: &mut Vec<SessionEvent>) {
+    if let Some(session) = data.sessions.iter().find(|s| s.id == id) {
+        events.push(SessionEvent::SessionChanged(session.clone()));
+    }
 }

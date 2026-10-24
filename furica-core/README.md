@@ -37,41 +37,47 @@ retained. Incomplete content is marked Interrupted and is excluded from model re
 ACP capture covers the information actually reported by the agent; optional model,
 name, argument and result fields are not invented.
 
-## Main-model execution and host save acknowledgement
+## Main-model execution and host message acknowledgement
 
 Only the main-model workflow prepares and controls ACP work. The host submits
-user text/audio through `CoreHandle`; the model uses `prepare_run` or
-`prepare_next_run` to request execution. ACP preparation, launch, answers,
-cancellation and close are internal commands, not public host methods.
+user text/audio through `CoreHandle`; ACP and `speak` remain internal model tools.
+Core receives `SessionData` from Host and maintains runtime memory. It has no
+storage port, database dependency or persistence callback.
 
-Prepared work waits until the host successfully saves its snapshot and calls
-`acknowledge_saved(&snapshot)`. Core then schedules only model-prepared runs in
-that snapshot, in preparation order. Work created while a save is in progress
-waits for a subsequent save. Repeated acknowledgements never repeat accepted
-execution; cancelled, completed or imported interrupted work is not restarted.
+`pending_messages()` returns the oldest unacknowledged `(sequence, events)` group.
+`SessionEvent` carries complete affected records, including message ownership,
+sequence, timestamps, tool input/output and execution/question state. A group must
+be received atomically. Host persists the group and its receipt in one transaction,
+then acknowledges that sequence. The stream is identified by `delivery_id()`.
 
 ```rust,no_run
-use furica_core::{Result, sessions::{SessionData, SessionManager}};
+use furica_core::{Result, sessions::{SessionEvent, SessionManager}};
+use uuid::Uuid;
 
-// Called inside the host's Tokio runtime, initially and after change notifications.
-fn save_latest(
+// Serialize receipt and acknowledgement inside the host's Tokio runtime.
+fn receive_pending(
     sessions: &SessionManager,
-    save: impl FnOnce(&SessionData) -> Result<()>,
+    mut receive: impl FnMut(Uuid, u64, &[SessionEvent]) -> Result<()>,
 ) -> Result<()> {
-    let saved = sessions.snapshot()?;
-    save(&saved)?; // If saving fails, do not acknowledge.
-    sessions.acknowledge_saved(&saved)
+    while let Some((sequence, events)) = sessions.pending_messages()? {
+        receive(sessions.delivery_id(), sequence, &events)?;
+        sessions.acknowledge_messages(sequence)?;
+    }
+    Ok(())
 }
 ```
 
-`changes()` provides a coalescing watch notification; `snapshot()` returns a complete
-consistent value. Subscribe before taking the initial snapshot, process saves
-serially, and reread the full snapshot after each notification. Pass the same
-successfully saved snapshot to `acknowledge_saved`; do not read a fresh snapshot
-between saving and acknowledging. Core checks prepared execution/input/configuration
-against current memory but cannot verify that a database transaction committed.
-Do not hold a watch borrow while querying/updating the manager. The host flushes a
-final snapshot after shutdown and handles save failures and retries.
+Reading does not consume a group. Failed receipt leaves it available for retry;
+acknowledgement is ordered and repeated acknowledgements do not relaunch work.
+Only acknowledged, still-Prepared runs may start. New work waits for its own group.
+Cancelled, archived or imported interrupted work is not restarted.
+
+`messages_available()` is a coalescing wake-up hint: subscribe first, then drain
+the queue serially on startup and notifications. Unacknowledged groups stay in memory; Host must keep receiving them to avoid
+unbounded retention during a prolonged storage failure. The host drains remaining
+messages after shutdown. This queue is in memory: uncommitted output is not durable
+across process termination. Committed records recover without replaying side effects.
+Audio continues to use `PlaybackChunk` and the existing playback feedback contract.
 
 The host can observe ACP work through these read-only queries:
 
@@ -83,9 +89,9 @@ The host can observe ACP work through these read-only queries:
 | `recent_runs_for_session(session_id, limit)` | Recent executions for a business session |
 | `subscribe()` | Live execution, progress and question notifications |
 
-The broadcast feed is for UI notifications and may lag; reread a snapshot after
-`Lagged`. It is not a durable change log. Complete messages and tool results are in
-`SessionData`; `Run.summary` is a bounded display summary.
+The broadcast feed is for UI notifications and may lag; query Host database views
+after `Lagged`. It is separate from acknowledged message delivery. `Run.summary`
+is a bounded display summary, not the complete output.
 
 Imported data is validated before use. Connections are marked Disconnected,
 unfinished executions Interrupted and pending questions Cancelled. Orphaned main
@@ -189,7 +195,7 @@ retain `VoiceEvent::ToolCall` / `VoiceCommand::ToolResult`; the actor uses the s
 ACP entries and the backend still owns its history. `execution_tools()` remains
 available and derives declarations from those entries. This registry is internal
 and provides no host registration or plugin API. ACP execution still waits for
-the host's save acknowledgement; speech follows its own playback queue.
+the host's message acknowledgement; speech follows its own playback queue.
 
 `speak` immediately returns `accepted: true` and a unique `request_id`. Model
 continuation does not wait for synthesis or playback. Each voice connection owns

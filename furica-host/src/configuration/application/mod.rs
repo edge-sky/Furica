@@ -148,7 +148,7 @@ pub struct RuntimeLimits {
     pub heartbeat_timeout_ms: u64,
     pub upload_retry_limit: u32,
     pub upload_retry_window_ms: u64,
-    pub snapshot_max_bytes: u64,
+    pub context_max_bytes: u64,
 }
 
 impl Default for RuntimeLimits {
@@ -169,7 +169,7 @@ impl Default for RuntimeLimits {
             heartbeat_timeout_ms: 15_000,
             upload_retry_limit: 3,
             upload_retry_window_ms: 2000,
-            snapshot_max_bytes: 64 * 1024 * 1024,
+            context_max_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -283,8 +283,8 @@ impl HostConfig {
             || l.upload_retry_limit > 32
             || l.upload_retry_window_ms == 0
             || l.upload_retry_window_ms > 30_000
-            || l.snapshot_max_bytes == 0
-            || l.snapshot_max_bytes > 1024 * 1024 * 1024
+            || l.context_max_bytes == 0
+            || l.context_max_bytes > 1024 * 1024 * 1024
             || self
                 .instructions
                 .as_ref()
