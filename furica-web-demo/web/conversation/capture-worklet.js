@@ -2,7 +2,7 @@
 class CaptureProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.frame = new Int16Array(512);
+    this.frame = new Int16Array(1600);
     this.offset = 0;
   }
   process(inputs) {
@@ -13,9 +13,9 @@ class CaptureProcessor extends AudioWorkletProcessor {
       for (const channel of channels) sample += channel[i] / channels.length;
       sample = Math.max(-1, Math.min(1, sample));
       this.frame[this.offset++] = Math.round(sample * (sample < 0 ? 32768 : 32767));
-      if (this.offset === 512) {
+      if (this.offset === 1600) {
         this.port.postMessage(this.frame.buffer, [this.frame.buffer]);
-        this.frame = new Int16Array(512);
+        this.frame = new Int16Array(1600);
         this.offset = 0;
       }
     }

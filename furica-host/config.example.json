@@ -1,7 +1,6 @@
 {
   "http": {
     "listen": "127.0.0.1:8765",
-    "token_env": "FURICA_HOST_TOKEN",
     "allowed_origins": []
   },
   "workspace": "/absolute/path/to/workspace",
@@ -10,7 +9,7 @@
     "endpoint": "https://your-model-provider.example/v1/chat/completions",
     "model": "REPLACE_WITH_MODEL_NAME",
     "isolation_scope": "REPLACE_WITH_NON_SECRET_ACCOUNT_SCOPE",
-    "api_key_env": "FURICA_MODEL_KEY",
+    "api_key": "REPLACE_WITH_PROVIDER_API_KEY",
     "connect_timeout_ms": 10000,
     "max_tokens_field": "max_completion_tokens",
     "supports_reasoning_effort": false

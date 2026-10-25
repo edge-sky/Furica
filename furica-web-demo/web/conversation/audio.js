@@ -1,7 +1,6 @@
 export class AudioBridge {
   constructor(send, sendAudio, onError, onStatus) {
     Object.assign(this, { send, sendAudio, onError, onStatus });
-    this.sequence = 0n;
     this.generation = null;
     this.blockedGeneration = null;
     this.sources = new Set();
@@ -30,10 +29,9 @@ export class AudioBridge {
       this.silent.gain.value = 0;
       this.capture.port.onmessage = event => {
         const samples = new Int16Array(event.data);
-        const packet = new ArrayBuffer(8 + samples.length * 2);
+        const packet = new ArrayBuffer(samples.length * 2);
         const view = new DataView(packet);
-        view.setBigUint64(0, this.sequence++, true);
-        samples.forEach((sample, i) => view.setInt16(8 + i * 2, sample, true));
+        samples.forEach((sample, i) => view.setInt16(i * 2, sample, true));
         try { this.sendAudio(packet); } catch (error) { this.stopCapture(); this.onError(error); }
       };
       this.capture.onprocessorerror = () => { this.stopCapture(); this.onError(new Error('音频采集处理器退出，请重新启动内核。')); };

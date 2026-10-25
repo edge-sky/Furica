@@ -1,3 +1,4 @@
+pub mod credentials;
 pub mod prompts;
 pub mod runtime;
 
@@ -22,7 +23,8 @@ pub struct HostConfig {
 pub struct HttpConfig {
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
-    pub token_env: String,
+    #[serde(default = "new_access_token")]
+    pub token: String,
     #[serde(default)]
     pub allowed_origins: Vec<String>,
 }
@@ -34,7 +36,8 @@ pub enum ModelConfig {
         endpoint: String,
         model: String,
         isolation_scope: String,
-        api_key_env: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
         #[serde(default = "ten_seconds")]
         connect_timeout_ms: u64,
         #[serde(default = "default_token_field")]
@@ -46,7 +49,8 @@ pub enum ModelConfig {
         endpoint: String,
         model: String,
         isolation_scope: String,
-        api_key_env: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
         #[serde(default = "ten_seconds")]
         connect_timeout_ms: u64,
         #[serde(default)]
@@ -56,7 +60,8 @@ pub enum ModelConfig {
         endpoint: String,
         model: String,
         isolation_scope: String,
-        api_key_env: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
         #[serde(default = "ten_seconds")]
         connect_timeout_ms: u64,
         #[serde(default = "default_anthropic_version")]
@@ -66,6 +71,16 @@ pub enum ModelConfig {
         #[serde(default)]
         supports_thinking_budget: bool,
     },
+}
+
+impl ModelConfig {
+    pub fn api_key(&self) -> Option<&str> {
+        match self {
+            Self::OpenaiCompatible { api_key, .. }
+            | Self::OpenaiResponses { api_key, .. }
+            | Self::Anthropic { api_key, .. } => api_key.as_deref(),
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -86,12 +101,14 @@ pub enum SttConfig {
     Aliyun {
         endpoint: String,
         model: String,
-        api_key_env: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
     },
     Volcengine {
         endpoint: String,
         model: String,
-        api_key_env: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
         resource_id: String,
     },
 }
@@ -103,13 +120,15 @@ pub enum TtsConfig {
         endpoint: String,
         model: String,
         voice: String,
-        api_key_env: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
     },
     Volcengine {
         endpoint: String,
         model: String,
         voice: String,
-        api_key_env: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
         resource_id: String,
     },
 }
@@ -204,14 +223,14 @@ fn thirty_minutes() -> u64 {
 fn present(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 8192 && !value.chars().any(char::is_control)
 }
-pub fn env_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .enumerate()
-            .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()))
+pub(crate) fn new_access_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
+
 fn endpoint(value: &str) -> bool {
     provider_endpoint(value, false)
 }
@@ -245,7 +264,8 @@ impl HostConfig {
     pub fn validate(&self) -> Result<()> {
         let l = &self.limits;
         if !self.http.listen.ip().is_loopback()
-            || !env_name(&self.http.token_env)
+            || self.http.token.len() < 32
+            || !credentials::valid(Some(&self.http.token))
             || !self.workspace.is_absolute()
             || l.channel_capacity == 0
             || l.channel_capacity > 4096
@@ -281,7 +301,7 @@ impl HostConfig {
                     endpoint,
                     model,
                     isolation_scope,
-                    api_key_env,
+                    api_key,
                     connect_timeout_ms,
                     max_tokens_field,
                     ..
@@ -296,7 +316,7 @@ impl HostConfig {
                         endpoint,
                         model,
                         isolation_scope,
-                        api_key_env,
+                        api_key,
                         connect_timeout_ms,
                     )
                 }
@@ -304,21 +324,21 @@ impl HostConfig {
                     endpoint,
                     model,
                     isolation_scope,
-                    api_key_env,
+                    api_key,
                     connect_timeout_ms,
                     ..
                 } => (
                     endpoint,
                     model,
                     isolation_scope,
-                    api_key_env,
+                    api_key,
                     connect_timeout_ms,
                 ),
                 ModelConfig::Anthropic {
                     endpoint,
                     model,
                     isolation_scope,
-                    api_key_env,
+                    api_key,
                     connect_timeout_ms,
                     version,
                     ..
@@ -330,7 +350,7 @@ impl HostConfig {
                         endpoint,
                         model,
                         isolation_scope,
-                        api_key_env,
+                        api_key,
                         connect_timeout_ms,
                     )
                 }
@@ -338,7 +358,7 @@ impl HostConfig {
             if !endpoint(url)
                 || !present(name)
                 || !present(scope)
-                || !env_name(key)
+                || !credentials::valid(key.as_deref())
                 || !timeout(*connect_timeout)
                 || !timeout(l.connect_timeout_ms)
                 || !timeout(l.idle_timeout_ms)
@@ -382,15 +402,18 @@ impl HostConfig {
                     SttConfig::Aliyun {
                         endpoint: url,
                         model,
-                        api_key_env,
+                        api_key,
                     }
                     | SttConfig::Volcengine {
                         endpoint: url,
                         model,
-                        api_key_env,
+                        api_key,
                         ..
                     } => {
-                        if !endpoint(url) || !present(model) || !env_name(api_key_env) {
+                        if !endpoint(url)
+                            || !present(model)
+                            || !credentials::valid(api_key.as_deref())
+                        {
                             return Err(Error::config());
                         }
                     }
@@ -409,25 +432,25 @@ impl HostConfig {
                 {
                     return Err(Error::config());
                 }
-                let (url, model, voice, api_key_env) = match tts {
+                let (url, model, voice, api_key) = match tts {
                     TtsConfig::Aliyun {
                         endpoint,
                         model,
                         voice,
-                        api_key_env,
+                        api_key,
                     }
                     | TtsConfig::Volcengine {
                         endpoint,
                         model,
                         voice,
-                        api_key_env,
+                        api_key,
                         ..
-                    } => (endpoint, model, voice, api_key_env),
+                    } => (endpoint, model, voice, api_key),
                 };
                 if !provider_endpoint(url, matches!(tts, TtsConfig::Aliyun { .. }))
                     || !present(model)
                     || !present(voice)
-                    || !env_name(api_key_env)
+                    || !credentials::valid(api_key.as_deref())
                     || matches!(tts, TtsConfig::Volcengine { resource_id, .. } if !present(resource_id))
                 {
                     return Err(Error::config());

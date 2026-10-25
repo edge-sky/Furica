@@ -10,34 +10,41 @@
 Host 仍提供健康检查、配置和会话记录管理，文字输入返回 `model_unavailable`，语音入口返回 `voice_unavailable`。
 配置检查集中在 Host，只检查已启用能力需要的参数；Core 接收上层准备好的运行参数并向外报告执行错误。
 
-需要文字对话时，填写 `config.example.json` 中的实际模型协议、端点、模型名与凭证环境变量；
+需要文字对话时，填写 `config.example.json` 中的实际模型协议、端点、模型名与直接保存的 `api_key`；
 需要 ACP 时再填写 Agent 启动配置。示例中的 `.example` 域名和路径是占位值。
 STT 与 TTS 可分别配置：连续语音输入需要 VAD、STT 和会话模型，TTS 用于可选的 `speak` 输出。
-只有配置会话模型时才需要 `<data-directory>/system-prompt.toml` 和模型凭证；
-不配置模型时不会读取提示词文件。所选模型必须支持已有的工具调用契约。
+会话模型配置了 API Key 后，启动时读取 `<data-directory>/system-prompt.toml`；
+缺少密钥的模型或云端语音能力保持未启用，仍可进入配置接口补齐。所选模型必须支持已有的工具调用契约。
 下面的命令演示启用会话模型的启动方式。
 
 ```sh
 mkdir -p /absolute/path/to/host-data
 cp furica-host/system-prompt.toml /absolute/path/to/host-data/system-prompt.toml
-export FURICA_HOST_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-export FURICA_MODEL_KEY='YOUR_PROVIDER_KEY'
 cargo run -p furica-host -- /absolute/path/to/host-data --initialize /absolute/path/to/config.json
 ```
 
 后续启动省略 `--initialize`，从 SQLite 读取配置；已有配置时携带初始化文件会被拒绝。
-访问令牌至少 32 字节，所有凭证仅从配置引用的环境变量读取。
-Host 为数据目录设置 Unix 0700 权限。
+所有凭证直接保存在数据库：服务商使用 `api_key`，访问令牌使用 `http.token`，不读取凭证环境变量。
+首次初始化省略 `http.token` 时生成随机令牌并持久化；手动指定的令牌至少 32 字节。
+每次启动将数据库中的令牌原子同步到 `<data-directory>/access-token`，供 Web 等本机客户端读取。
+修改令牌需要重启 Host；Web 使用 `--token-file` 读取该文件，随后重启 Web 生效。
+密钥与令牌在 SQLite 中明文保存；Host 为数据目录设置 Unix 0700、数据库与令牌文件设置 0600 权限。
 `configuration.sqlite3` 同时保存配置与会话记录，不能作为网站静态目录公开。
 进程通过 `.host.lock.sqlite3` 的排他锁独占数据目录，第二个进程在访问数据库前被拒绝，进程退出自动释放。
 Ctrl-C / SIGTERM 会停止接入、释放语音、等待 Core/ACP 清理并接收并提交剩余消息；失败以非零状态退出。
 
-`GET/PUT /configuration` 查询/事务保存下次启动配置，返回 `saved` 和 `restart_required`。
+`GET/PUT /configuration` 查询/事务保存下次启动配置，保存返回 `saved` 和 `restart_required`。
+查询省略密钥与访问令牌原文，分别返回 `api_key_configured` 和 `token_configured` 布尔状态。
+保存时省略 API Key 表示保留同一协议/服务商的原值，字符串表示替换，null 表示清除；空字符串拒绝保存。
+访问令牌省略表示保留，可用新字符串替换，不允许清空。只读状态字段不写入数据库。
+密钥保留合并、配置校验和替换在同一 SQLite 写事务内完成；失败保留完整原配置。
 配置表 `host_configuration(key, value)` 按字段存储：key 使用点分路径（如 `model.endpoint`），
 value 使用 JSON 编码，数组作为一个值保存。读取缺失字段时使用代码中已有的默认值，
 读取操作不将默认值写回数据库；非法值或缺失必要字段仍报配置错误。
 整份配置保存采用事务替换，因此切换协议不会遗留旧协议字段。
-数据库版本为 4，只支持新建空数据库或打开版本 4；旧版本直接拒绝，不提供迁移或旧 JSON 导入。
+数据库版本为 4，只支持新建空数据库或打开版本 4；其他版本直接拒绝，不导入旧 JSON。
+版本 4 中的旧 `api_key_env` / `http.token_env` 在启动事务中移除，不读取其引用的环境变量。
+若旧库尚无直接访问令牌，则生成并提交一个新令牌；业务会话与其他配置保留。服务商 API Key 需直接补填。
 修改数据库不热更新当前组件、凭证、监听地址或 CORS 名单。
 启动时校验配置、加载选中能力和本地文件；云端连接/账号是否有效仍需真实调用验证。
 
@@ -53,7 +60,7 @@ system = '''
 ```
 
 文件中的多行文本可直接手动编辑，示例还包含系统描述、功能调用策略与结果解释规则。
-配置会话模型时，文件在每次进程启动时读取，修改后重启生效；此时文件必须存在、使用 UTF-8、大小不超过 1 MiB。
+会话模型配置 API Key 后，文件在每次进程启动时读取，修改后重启生效；此时文件必须存在、使用 UTF-8、大小不超过 1 MiB。
 格式错误、额外键、非字符串值、空白提示词、未知或未闭合变量会阻止启动。
 渲染后的文本仍受 `limits.max_context_bytes` 约束，模型请求还会统一计算历史和工具定义的预算。
 
@@ -70,15 +77,15 @@ core 继续接收渲染后的字符串，不读取 TOML 文件。工具参数和
 
 ## HTTP 交互
 
-所有业务请求都使用 `Authorization: Bearer $FURICA_HOST_TOKEN`，包括 `/health` 和 SSE。
+所有业务请求都使用 `Authorization: Bearer $(cat /absolute/path/to/host-data/access-token)`，包括 `/health` 和 SSE。
 监听地址仅允许回环 IP。Host 头须为实际监听地址或 `localhost:端口`。
 浏览器 Origin 需精确写入 `http.allowed_origins`，不能使用 `*`；无 Origin 的本机客户端仍需令牌。
 浏览器通过 fetch 读取 SSE/音频，以便携带请求头；不要将令牌放在 URL 中。
 
 ```sh
-curl -H "Authorization: Bearer $FURICA_HOST_TOKEN" http://127.0.0.1:8765/health
-curl -X POST -H "Authorization: Bearer $FURICA_HOST_TOKEN" http://127.0.0.1:8765/sessions
-curl -H "Authorization: Bearer $FURICA_HOST_TOKEN" -H 'Content-Type: application/json' \
+curl -H "Authorization: Bearer $(cat /absolute/path/to/host-data/access-token)" http://127.0.0.1:8765/health
+curl -X POST -H "Authorization: Bearer $(cat /absolute/path/to/host-data/access-token)" http://127.0.0.1:8765/sessions
+curl -H "Authorization: Bearer $(cat /absolute/path/to/host-data/access-token)" -H 'Content-Type: application/json' \
   -d '{"text":"你好"}' http://127.0.0.1:8765/sessions/SESSION_UUID/text
 ```
 
@@ -122,9 +129,9 @@ VAD 使用现有 Silero 默认触发策略，输入/输出均固定单声道 16 
 不接声纹门控；所有者主动开启。此选择已经在实施契约中确认。
 
 STT 的 `provider` 支持 `sensevoice`（`model_path`、`tokens_path`）、
-`aliyun`（`endpoint`、`model`、`api_key_env`）、
+`aliyun`（`endpoint`、`model`、`api_key`）、
 `volcengine`（再加 `resource_id`）。
-TTS 的 `provider` 支持 `aliyun` / `volcengine`，字段为 `endpoint`、`model`、`voice`、`api_key_env`，
+TTS 的 `provider` 支持 `aliyun` / `volcengine`，字段为 `endpoint`、`model`、`voice`、`api_key`，
 Volcengine 再加 `resource_id`。Host 传入 16000 输出采样率；不兼容的配置会报错。
 本地模型不由 Host 下载。
 

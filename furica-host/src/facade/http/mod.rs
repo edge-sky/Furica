@@ -3,10 +3,7 @@ mod projection;
 mod sessions;
 mod voice;
 
-use crate::{
-    Error, Host, Result, configuration::application::HostConfig, facade::constant_eq,
-    infrastructure::sqlite::ConfigStore,
-};
+use crate::{Error, Host, Result, facade::constant_eq, infrastructure::sqlite::ConfigStore};
 use bytes::Bytes;
 use furica_core::playback::{PlaybackChunk, PlaybackState};
 use futures_util::stream;
@@ -265,12 +262,15 @@ async fn route(mut request: Request<Incoming>, access: Arc<Access>) -> Result<Ht
             let config = tokio::task::spawn_blocking(move || store.read())
                 .await
                 .map_err(|_| Error::storage())??;
-            Ok(json_response(200, json!(config)))
+            Ok(json_response(
+                200,
+                crate::configuration::application::credentials::view(&config)?,
+            ))
         }
         ("PUT", ["configuration"]) => {
-            let config: HostConfig = json_body(&mut request).await?;
+            let config: Value = json_body(&mut request).await?;
             let store = access.store.clone();
-            tokio::task::spawn_blocking(move || store.save(&config))
+            tokio::task::spawn_blocking(move || store.save_update(config))
                 .await
                 .map_err(|_| Error::storage())??;
             Ok(json_response(

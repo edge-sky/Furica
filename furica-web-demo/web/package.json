@@ -2,6 +2,6 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test conversation/audio.test.mjs"
+    "test": "node --test *.test.mjs conversation/*.test.mjs"
   }
 }

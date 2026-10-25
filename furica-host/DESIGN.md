@@ -31,12 +31,12 @@ HTTP 投影排除模型原始 continuation。PlaybackPosition、PlaybackChunk �
 | 部分/对象 | 字段及含义 |
 | --- | --- |
 | `HostConfig` | `http`、`workspace`（绝对路径）、`model`（可空）、`speech`（可空）、`acp`（可空）、`limits` |
-| `HttpConfig` | `listen`（回环 IP 与端口）、`token_env`（非空环境变量名）、`allowed_origins`（完整 origin 列表，默认空） |
-| `ModelConfig` | `protocol`（`openai_compatible` / `openai_responses` / `anthropic`）、`endpoint`、`model`、`isolation_scope`、`api_key_env`、`connect_timeout_ms` |
+| `HttpConfig` | `listen`（回环 IP 与端口）、`token`（直接访问令牌，首次初始化省略时生成并持久化）、`allowed_origins`（完整 origin 列表，默认空） |
+| `ModelConfig` | `protocol`（`openai_compatible` / `openai_responses` / `anthropic`）、`endpoint`、`model`、`isolation_scope`、`api_key`（可空的直接密钥）、`connect_timeout_ms` |
 | 模型协议选项 | compatible：`max_tokens_field`、`supports_reasoning_effort`；responses：`supports_reasoning`；anthropic：`version`、`supports_adaptive_thinking`、`supports_thinking_budget`。按 protocol 定义带标签枚举，不接受不适用字段 |
 | `SpeechConfig` | `vad_model`（可空的绝对 ONNX 文件路径）、`stt`（可空）、`tts`（可空）。连续语音输入使用 VAD、STT 与会话模型，TTS 独立可选 |
-| `SttConfig` | 带标签枚举：`sensevoice` 使用 `model_path`、`tokens_path`；`aliyun` 使用 `endpoint`、`model`、`api_key_env`；`volcengine` 使用前述云端字段及 `resource_id` |
-| `TtsConfig` | 带标签枚举：`aliyun` 使用 `endpoint`、`model`、`voice`、`api_key_env`；`volcengine` 再含 `resource_id`。输出采样率固定为本轮已确认的 16000，由 Host 传入现有配置并检查 |
+| `SttConfig` | 带标签枚举：`sensevoice` 使用 `model_path`、`tokens_path`；`aliyun` 使用 `endpoint`、`model`、`api_key`（可空的直接密钥）；`volcengine` 使用前述云端字段及 `resource_id` |
+| `TtsConfig` | 带标签枚举：`aliyun` 使用 `endpoint`、`model`、`voice`、`api_key`（可空的直接密钥）；`volcengine` 再含 `resource_id`。输出采样率固定为本轮已确认的 16000，由 Host 传入现有配置并检查 |
 | `AcpConfig` | `command`（绝对可执行文件路径）、`agent_id`、`args`、`auth_method`（可空）、`handshake_timeout_ms`、`run_timeout_ms`、`cancel_timeout_ms`、`idle_timeout_ms`。映射到现有适配器 AcpConfig，不复制执行协议 |
 | `RuntimeLimits` | `channel_capacity`、`connect_timeout_ms`、`idle_timeout_ms`、`inference_timeout_ms`、`max_history_messages`、`max_context_bytes`、`max_output_tokens`、`max_utterance_ms`、`max_generated_audio_ms`、`max_acp_sessions`、`max_runs`、`question_timeout_ms`、`heartbeat_timeout_ms`、`upload_retry_limit`、`upload_retry_window_ms`、`context_max_bytes` |
 
@@ -57,7 +57,11 @@ SQLite 使用 `PRAGMA user_version=4`，只支持新建空库或打开版本 4�
 连接使用 synchronous=FULL 和有界 busy timeout。目录锁保存在独立锁库。
 
 配置更新先验证结构和静态边界，再提交；报告 `restart_required=true`，不热应用。
-配置中仅保存凭证环境变量名；访问令牌与供应商密钥不写数据库、事件或日志。
+配置中的 `http.token` 与服务商 `api_key` 直接保存在数据库，不引用环境变量。供应商密钥可空，缺失时对应能力保持未启用。
+查询配置省略凭证原文，仅返回 `token_configured` / `api_key_configured` 布尔状态；保存时省略密钥保留同协议/服务商的旧值，字符串替换，null 清除。访问令牌只支持保留和替换。
+密钥保留合并与整份配置保存共用一个写事务；只读状态字段不入库，凭证不进入事件、错误或日志。
+每次启动将数据库中的访问令牌原子同步到数据目录的 `access-token` 文件，供 Web 服务端通过 `--token-file` 加载；令牌轮换需依次重启 Host、Web。
+SQLite 中凭证明文保存；数据目录 Unix 0700、数据库和令牌文件 0600。版本 4 旧环境变量引用在启动事务中退出，访问令牌缺失时生成一次并提交，不读取环境变量，不更改会话记录。
 
 系统提示词以数据目录中的 `system-prompt.toml` 为唯一来源，使用单个 `system` 字符串 K-V。
 文件只包含提示词工程文本；语言、时区和工作目录的变量值与一次替换集中在

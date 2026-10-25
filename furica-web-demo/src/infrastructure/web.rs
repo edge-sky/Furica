@@ -1,178 +1,165 @@
-//! Loopback HTTP/WebSocket transport. Exactly one browser owns the device session
-//! and snapshot writer, including while the owner is shutting down.
-use crate::{
-    conversation::{Command, Session, infrastructure::input::decode_audio, presentation},
-    settings::{SettingsStore, presentation as settings_view},
-};
+//! Static Web shell and streaming, same-origin transport to an existing Host.
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
-use http_body_util::{BodyExt, Full, Limited};
+use futures_util::StreamExt;
+use http_body_util::{BodyExt, Full, Limited, StreamBody, combinators::UnsyncBoxBody};
 use hyper::{
-    Request, Response, StatusCode, body::Incoming, server::conn::http1, service::service_fn,
+    Method, Request, Response, StatusCode,
+    body::{Frame, Incoming},
+    header,
+    server::conn::http1,
+    service::service_fn,
 };
-use hyper_util::rt::TokioIo;
-use serde_json::{Value, json};
-use std::{
-    convert::Infallible,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use reqwest::{Client, Url};
+use std::{convert::Infallible, io, net::IpAddr, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
-use tokio_tungstenite::{
-    WebSocketStream,
-    tungstenite::{
-        Message,
-        handshake::server::create_response,
-        protocol::{Role, WebSocketConfig},
-    },
-};
 use tokio_util::sync::CancellationToken;
 
-type HostResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-type Body = Full<Bytes>;
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+type Body = UnsyncBoxBody<Bytes, io::Error>;
 
-pub async fn serve(config: Arc<SettingsStore>, port: u16) -> HostResult<()> {
+pub fn host_url(value: &str) -> Result<Url> {
+    let url = Url::parse(value)?;
+    let loopback = url.host_str().is_some_and(|host| {
+        host.trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    });
+    if url.scheme() != "http"
+        || !loopback
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("--host requires an HTTP loopback IP URL without credentials or a path".into());
+    }
+    Ok(url)
+}
+
+pub async fn serve(host: Url, token: String, port: u16) -> Result<()> {
+    let client = Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .build()?;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
     let port = listener.local_addr()?.port();
-    println!(
-        "Furica demo: http://127.0.0.1:{port}\nExternal configuration remains server-side. Ctrl+C stops the host."
-    );
-    let busy = Arc::new(AtomicBool::new(false));
+    if host.port_or_known_default() == Some(port) && host.host_str() == Some("127.0.0.1") {
+        return Err("Web and Host must use different listeners".into());
+    }
+    println!("Furica Web: http://127.0.0.1:{port}\nHost: {host}");
+    let token = Arc::new(token);
     let stop = CancellationToken::new();
     let mut connections = tokio::task::JoinSet::new();
-    loop {
+    let shutdown = async {
+        #[cfg(unix)]
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! { _ = tokio::signal::ctrl_c() => (), _ = signal.recv() => () }
+            return;
+        }
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    tokio::pin!(shutdown);
+    let result = loop {
         tokio::select! {
-            _=tokio::signal::ctrl_c()=>break,
-            incoming=listener.accept()=>{
-                let (socket,_)=incoming?;
-                let config=config.clone(); let busy=busy.clone(); let stop=stop.clone();
+            _ = &mut shutdown => break Ok(()),
+            Some(_) = connections.join_next(), if !connections.is_empty() => (),
+            incoming = listener.accept() => {
+                let (socket, _) = match incoming { Ok(value) => value, Err(error) => break Err(error.into()) };
+                if connections.len() >= 256 { continue; }
+                let (client, host, token, stop) = (client.clone(), host.clone(), token.clone(), stop.clone());
                 connections.spawn(async move {
-                    let service=service_fn(move |request| http(request,config.clone(),busy.clone(),stop.clone(),port));
-                    let connection=http1::Builder::new().serve_connection(TokioIo::new(socket),service).with_upgrades();
-                    let _=connection.await;
+                    let service = service_fn(move |request| handle(request, client.clone(), host.clone(), token.clone(), port));
+                    let mut builder = http1::Builder::new();
+                    builder.timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(5)).max_headers(64).max_buf_size(32768);
+                    let connection = builder.serve_connection(TokioIo::new(socket), service);
+                    tokio::pin!(connection);
+                    tokio::select! { _ = &mut connection => (), _ = stop.cancelled() => () }
                 });
             }
-            Some(_)=connections.join_next()=>(),
         }
-    }
+    };
     stop.cancel();
-    // Upgraded connections have their own task. Its lease remains held until
-    // Core shutdown has acknowledged cancellation and released the database.
-    let _ = tokio::time::timeout(Duration::from_secs(15), async {
-        while busy.load(Ordering::Acquire) {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await;
-    connections.abort_all();
-    Ok(())
+    while connections.join_next().await.is_some() {}
+    result
 }
 
 fn response(status: StatusCode, content_type: &str, body: impl Into<Bytes>) -> Response<Body> {
-    Response::builder().status(status).header("Content-Type",content_type)
-        .header("Cache-Control","no-store").header("X-Content-Type-Options","nosniff")
-        .header("Content-Security-Policy","default-src 'self'; connect-src 'self'; script-src 'self'; style-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
-        .body(Full::new(body.into())).expect("static response headers")
+    let mut response = Response::new(
+        Full::new(body.into())
+            .map_err(|never| match never {})
+            .boxed_unsync(),
+    );
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        content_type.parse().expect("static content type"),
+    );
+    secure(&mut response);
+    response
 }
 
-fn allowed_host(host: &str, port: u16) -> bool {
-    host == format!("127.0.0.1:{port}") || host == format!("localhost:{port}")
+fn secure(response: &mut Response<Body>) {
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+    headers.insert("content-security-policy", "default-src 'self'; connect-src 'self'; script-src 'self'; style-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'".parse().unwrap());
 }
 
-async fn http(
-    mut request: Request<Incoming>,
-    config: Arc<SettingsStore>,
-    busy: Arc<AtomicBool>,
-    stop: CancellationToken,
-    port: u16,
-) -> Result<Response<Body>, Infallible> {
+fn allowed(request: &Request<Incoming>, port: u16) -> bool {
+    if request.headers().get_all(header::HOST).iter().count() != 1
+        || request.headers().get_all(header::ORIGIN).iter().count() > 1
+    {
+        return false;
+    }
     let host = request
         .headers()
-        .get("host")
-        .and_then(|value| value.to_str().ok())
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
         .unwrap_or("");
-    if !allowed_host(host, port) {
+    if host != format!("127.0.0.1:{port}") && host != format!("localhost:{port}") {
+        return false;
+    }
+    let origin = request.headers().get(header::ORIGIN);
+    if let Some(origin) = origin {
+        if origin.to_str().ok() != Some(format!("http://{host}").as_str()) {
+            return false;
+        }
+    } else if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        return false;
+    }
+    true
+}
+
+async fn handle(
+    request: Request<Incoming>,
+    client: Client,
+    host: Url,
+    token: Arc<String>,
+    port: u16,
+) -> std::result::Result<Response<Body>, Infallible> {
+    if !allowed(&request, port) {
         return Ok(response(
             StatusCode::FORBIDDEN,
             "text/plain",
-            "Loopback host required",
+            "Same-origin loopback request required",
         ));
     }
-    if request.uri().path() == "/api/settings" {
-        let host = host.to_owned();
-        return Ok(settings_http(request, config, host).await);
+    if request.uri().path().starts_with("/api/") {
+        return Ok(proxy(request, client, host, token).await);
     }
-    if request.method() != hyper::Method::GET {
+    if request.method() != Method::GET {
         return Ok(response(
             StatusCode::METHOD_NOT_ALLOWED,
             "text/plain",
             "GET required",
         ));
     }
-    if request.uri().path() == "/ws" {
-        let expected = format!("http://{host}");
-        if request
-            .headers()
-            .get("origin")
-            .and_then(|value| value.to_str().ok())
-            != Some(expected.as_str())
-        {
-            return Ok(response(
-                StatusCode::FORBIDDEN,
-                "text/plain",
-                "Same-origin browser required",
-            ));
-        }
-        let handshake_request = {
-            let mut builder = hyper::http::Request::builder()
-                .method(request.method())
-                .uri(request.uri());
-            *builder.headers_mut().expect("request builder") = request.headers().clone();
-            builder.body(()).expect("valid request")
-        };
-        let Ok(handshake) = create_response(&handshake_request) else {
-            return Ok(response(
-                StatusCode::BAD_REQUEST,
-                "text/plain",
-                "Invalid WebSocket handshake",
-            ));
-        };
-        if busy
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Ok(response(
-                StatusCode::CONFLICT,
-                "text/plain",
-                "Another browser owns this demo. Close it before reconnecting.",
-            ));
-        }
-        let lease = Lease(busy);
-        let upgraded = hyper::upgrade::on(&mut request);
-        tokio::spawn(async move {
-            let _lease = lease;
-            if let Ok(Ok(io)) = tokio::time::timeout(Duration::from_secs(5), upgraded).await {
-                let ws_config = WebSocketConfig::default()
-                    .max_message_size(Some(128 * 1024))
-                    .max_frame_size(Some(128 * 1024));
-                let socket = WebSocketStream::from_raw_socket(
-                    TokioIo::new(io),
-                    Role::Server,
-                    Some(ws_config),
-                )
-                .await;
-                if let Err(error) = connection(socket, config, stop).await {
-                    eprintln!("demo connection: {error}");
-                }
-            }
-        });
-        let (parts, _) = handshake.into_parts();
-        return Ok(Response::from_parts(parts, Full::new(Bytes::new())));
-    }
-    let (kind, body) = match request.uri().path() {
+    let (kind, content) = match request.uri().path() {
         "/" | "/index.html" => (
             "text/html; charset=utf-8",
             include_str!("../../web/index.html"),
@@ -181,260 +168,129 @@ async fn http(
             "text/css; charset=utf-8",
             include_str!("../../web/style.css"),
         ),
-        "/favicon.svg" => ("image/svg+xml", include_str!("../../web/favicon.svg")),
-        "/app.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("../../web/app.js"),
-        ),
+        "/app.js" => ("text/javascript", include_str!("../../web/app.js")),
+        "/host.js" => ("text/javascript", include_str!("../../web/host.js")),
         "/conversation/audio.js" => (
-            "text/javascript; charset=utf-8",
+            "text/javascript",
             include_str!("../../web/conversation/audio.js"),
         ),
+        "/conversation/voice.js" => (
+            "text/javascript",
+            include_str!("../../web/conversation/voice.js"),
+        ),
         "/conversation/capture-worklet.js" => (
-            "text/javascript; charset=utf-8",
+            "text/javascript",
             include_str!("../../web/conversation/capture-worklet.js"),
         ),
         "/sessions/panel.js" => (
-            "text/javascript; charset=utf-8",
+            "text/javascript",
             include_str!("../../web/sessions/panel.js"),
         ),
         "/settings/panel.js" => (
-            "text/javascript; charset=utf-8",
+            "text/javascript",
             include_str!("../../web/settings/panel.js"),
         ),
-        "/diagnostics.js" => (
-            "text/javascript; charset=utf-8",
-            include_str!("../../web/diagnostics.js"),
-        ),
-        "/health" => {
-            return Ok(response(
-                StatusCode::OK,
-                "application/json",
-                r#"{"ok":true}"#,
-            ));
-        }
+        "/diagnostics.js" => ("text/javascript", include_str!("../../web/diagnostics.js")),
+        "/favicon.svg" => ("image/svg+xml", include_str!("../../web/favicon.svg")),
         _ => return Ok(response(StatusCode::NOT_FOUND, "text/plain", "Not found")),
     };
-    Ok(response(StatusCode::OK, kind, body))
+    Ok(response(StatusCode::OK, kind, content))
 }
 
-async fn settings_http(
+async fn proxy(
     request: Request<Incoming>,
-    store: Arc<SettingsStore>,
-    host: String,
+    client: Client,
+    mut host: Url,
+    token: Arc<String>,
 ) -> Response<Body> {
-    let reading = request.method() == hyper::Method::GET;
-    let result = match *request.method() {
-        hyper::Method::GET => store.read().await,
-        hyper::Method::PUT => {
-            let expected = format!("http://{host}");
-            if request
-                .headers()
-                .get("origin")
-                .and_then(|v| v.to_str().ok())
-                != Some(expected.as_str())
-            {
-                return response(
-                    StatusCode::FORBIDDEN,
-                    "application/json",
-                    r#"{"error":"仅允许同源页面保存设置"}"#,
-                );
-            }
-            if request
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.split(';').next().unwrap_or("").trim())
-                != Some("application/json")
-            {
-                return response(
-                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    "application/json",
-                    r#"{"error":"需要 JSON 设置"}"#,
-                );
-            }
-            let bytes = match tokio::time::timeout(
-                Duration::from_secs(5),
-                Limited::new(request.into_body(), 64 * 1024).collect(),
-            )
-            .await
-            {
-                Ok(Ok(body)) => body.to_bytes(),
-                Ok(Err(_)) => {
-                    return response(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        "application/json",
-                        r#"{"error":"设置不能超过 64 KiB"}"#,
-                    );
-                }
-                Err(_) => {
-                    return response(
-                        StatusCode::REQUEST_TIMEOUT,
-                        "application/json",
-                        r#"{"error":"读取设置超时"}"#,
-                    );
-                }
-            };
-            let value = match serde_json::from_slice::<Value>(&bytes) {
-                Ok(value) => value,
-                Err(_) => {
-                    return response(
-                        StatusCode::BAD_REQUEST,
-                        "application/json",
-                        r#"{"error":"设置 JSON 格式无效"}"#,
-                    );
-                }
-            };
-            store.write(value).await
-        }
-        _ => {
+    // Only forward the request path, never an authority or browser credentials.
+    host.set_path(request.uri().path().strip_prefix("/api").expect("API path"));
+    host.set_query(request.uri().query());
+    let mut upstream = client
+        .request(request.method().clone(), host)
+        .bearer_auth(token.as_str());
+    for name in [
+        header::CONTENT_TYPE,
+        header::HeaderName::from_static("x-voice-token"),
+    ] {
+        if request.headers().get_all(&name).iter().count() > 1 {
             return response(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "application/json",
-                r#"{"error":"仅支持 GET 和 PUT"}"#,
+                StatusCode::BAD_REQUEST,
+                "text/plain",
+                "Duplicate request header",
+            );
+        }
+        if let Some(value) = request.headers().get(&name) {
+            upstream = upstream.header(name, value);
+        }
+    }
+    let bytes = match tokio::time::timeout(
+        Duration::from_secs(5),
+        Limited::new(request.into_body(), 1024 * 1024).collect(),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body.to_bytes(),
+        Ok(Err(_)) => {
+            return response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "text/plain",
+                "Request body exceeds its limit",
+            );
+        }
+        Err(_) => {
+            return response(
+                StatusCode::REQUEST_TIMEOUT,
+                "text/plain",
+                "Request body timed out",
             );
         }
     };
-    match result {
-        Ok(config) => response(
-            StatusCode::OK,
-            "application/json",
-            settings_view::response(&config).to_string(),
-        ),
-        Err(error) => response(
-            if reading {
-                StatusCode::INTERNAL_SERVER_ERROR
-            } else {
-                StatusCode::BAD_REQUEST
-            },
-            "application/json",
-            json!({"error":error.to_string()}).to_string(),
-        ),
+    let result = tokio::time::timeout(Duration::from_secs(30), upstream.body(bytes).send()).await;
+    let upstream = match result {
+        Ok(Ok(value)) => value,
+        _ => {
+            return response(
+                StatusCode::BAD_GATEWAY,
+                "application/json",
+                r#"{"code":"host_unavailable","message":"无法连接 Host，请检查进程、地址与访问令牌。","retryable":true}"#,
+            );
+        }
+    };
+    let status = upstream.status();
+    let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
+    let stream = upstream.bytes_stream().map(|chunk| {
+        chunk
+            .map(Frame::data)
+            .map_err(|_| io::Error::other("Host stream disconnected"))
+    });
+    let mut response = Response::new(StreamBody::new(stream).boxed_unsync());
+    *response.status_mut() = status;
+    if let Some(value) = content_type {
+        response.headers_mut().insert(header::CONTENT_TYPE, value);
     }
+    secure(&mut response);
+    response
 }
 
-struct Lease(Arc<AtomicBool>);
-impl Drop for Lease {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
-async fn send<S>(socket: &mut WebSocketStream<S>, value: Value) -> HostResult<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    tokio::time::timeout(
-        Duration::from_secs(3),
-        socket.send(Message::Text(value.to_string().into())),
-    )
-    .await??;
-    Ok(())
-}
-
-async fn connection<S>(
-    mut socket: WebSocketStream<S>,
-    config: Arc<SettingsStore>,
-    stop: CancellationToken,
-) -> HostResult<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let mut session: Option<Session> = None;
-    let result=async {
-        send(&mut socket,config.read().await?.public_status()).await?;
-        match crate::sessions::SnapshotStore::configured().load() {
-            Ok(data) => send(&mut socket, crate::sessions::snapshot(data)).await?,
-            Err(error) => send(&mut socket, json!({"type":"save_error","message":error.to_string()})).await?,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn host_address_is_explicit_loopback_without_credentials_or_redirects() {
+        for url in ["http://127.0.0.1:8765", "http://[::1]:8765"] {
+            assert!(host_url(url).is_ok());
         }
-        loop {
-            tokio::select! {
-                _=stop.cancelled()=>break,
-                event=async {match &mut session {Some(session)=>session.next().await,None=>std::future::pending().await}}=>{
-                    let stopped=event["type"]=="kernel_stopped";
-                    send(&mut socket,event).await?;
-                    if stopped && let Some(old)=session.take(){
-                        old.stop().await?;
-                        send(&mut socket,crate::sessions::snapshot(crate::sessions::SnapshotStore::configured().load()?)).await?;
-                    }
-                }
-                incoming=socket.next()=>{
-                    let Some(incoming)=incoming else {break};
-                    match incoming? {
-                        Message::Close(_)=>break,
-                        Message::Ping(bytes)=>{socket.send(Message::Pong(bytes)).await?;},
-                        Message::Text(text)=>{
-                            let command=match serde_json::from_str::<Command>(&text) {
-                                Ok(command)=>command,
-                                Err(_)=>{send(&mut socket,json!({"type":"error","message":"无效的控制消息或字段"})).await?;continue;},
-                            };
-                            match command {
-                                Command::Start {mode,speaker,session_id}=>{
-                                    if session.is_some(){send(&mut socket,json!({"type":"error","message":"请先停止当前内核"})).await?;continue;}
-                                    let latest = match config.read().await {
-                                        Ok(latest) => latest,
-                                        Err(_) => {send(&mut socket,json!({"type":"start_error","message":"无法读取服务设置"})).await?;continue;}
-                                    };
-                                    match Session::start(&latest,mode,&speaker,session_id).await {
-                                        Ok(started)=>{
-                                            send(&mut socket,json!({"type":"started","state":presentation::state(started.core.state()),"session_id":started.session_id})).await?;
-                                            send(&mut socket,crate::sessions::snapshot(started.manager.snapshot()?)).await?;
-                                            let playback=presentation::playback(*started.output.playback.borrow());
-                                            send(&mut socket,playback).await?;
-                                            session=Some(started);
-                                        }
-                                        Err(error)=>send(&mut socket,json!({"type":"start_error","message":error.to_string()})).await?,
-                                    }
-                                }
-                                Command::Stop=>{
-                                    if let Some(old)=session.take(){old.stop().await?;}
-                                    send(&mut socket,json!({"type":"stopped"})).await?;
-                                    send(&mut socket,crate::sessions::snapshot(crate::sessions::SnapshotStore::configured().load()?)).await?;
-                                }
-                                Command::Snapshot if session.is_none() => {
-                                    match crate::sessions::SnapshotStore::configured().load() {
-                                        Ok(data) => send(&mut socket,crate::sessions::snapshot(data)).await?,
-                                        Err(error) => send(&mut socket,json!({"type":"save_error","message":error.to_string()})).await?,
-                                    }
-                                }
-                                command=>{
-                                    match &session {
-                                        Some(current)=>match current.command(command).await {
-                                            Ok(value)=>send(&mut socket,value).await?,
-                                            Err(error)=>send(&mut socket,json!({"type":"error","message":error.to_string()})).await?,
-                                        },
-                                        None=>send(&mut socket,json!({"type":"error","message":"请先启动内核"})).await?,
-                                    }
-                                }
-                            }
-                        }
-                        Message::Binary(bytes)=>{
-                            let delivered=(||->furica_core::Result<()> {
-                                let frame=decode_audio(&bytes)?;
-                                let capture=session.as_ref().and_then(|session|session.capture.as_ref())
-                                    .ok_or_else(||furica_core::Error::State("语音采集尚未启动".into()))?;
-                                capture.try_send(frame).map_err(|_|furica_core::Error::Busy("demo VAD capture queue"))
-                            })();
-                            if let Err(error)=delivered {
-                                if let Some(current)=session.as_mut(){current.capture.take();let _=current.core.end_conversation().await;}
-                                send(&mut socket,json!({"type":"capture_error","message":error.to_string()})).await?;
-                            }
-                        }
-                        _=>(),
-                    }
-                }
-            }
-        }
-        Ok::<(),Box<dyn std::error::Error+Send+Sync>>(())
-    }.await;
-    if let Some(current) = session {
-        let cleanup = current.stop().await;
-        if result.is_ok() {
-            cleanup?;
+        for url in [
+            "https://127.0.0.1",
+            "http://localhost:8765",
+            "http://example.com",
+            "http://127.0.0.1/api",
+            "http://user:secret@127.0.0.1",
+            "http://127.0.0.1?token=secret",
+            "http://127.0.0.1#fragment",
+        ] {
+            assert!(host_url(url).is_err(), "{url}");
         }
     }
-    // SinkExt::close flushes the reply already queued by an incoming Close.
-    // Sending a second Message::Close would fail with SendAfterClosing.
-    let _ = tokio::time::timeout(Duration::from_secs(1), SinkExt::close(&mut socket)).await;
-    result
 }

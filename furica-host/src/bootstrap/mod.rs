@@ -21,24 +21,6 @@ use std::{
     time::Duration,
 };
 
-pub fn secret(name: &str) -> Result<String> {
-    let value = std::env::var(name).map_err(|_| {
-        Error::new(
-            503,
-            "credential_missing",
-            "required credential environment variable is missing",
-        )
-    })?;
-    if value.trim().is_empty() || value.len() > 8192 || value.contains(['\r', '\n']) {
-        return Err(Error::new(
-            503,
-            "credential_invalid",
-            "credential environment variable is invalid",
-        ));
-    }
-    Ok(value)
-}
-
 pub fn prepare_directory(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path).map_err(|_| Error::storage())?;
     #[cfg(unix)]
@@ -103,15 +85,12 @@ pub async fn start(
     .await
     .map_err(|_| Error::storage())??;
     std::fs::create_dir_all(&config.workspace).map_err(|_| Error::config())?;
-    let token = secret(&config.http.token_env)?;
-    if token.len() < 32 {
-        return Err(Error::new(
-            400,
-            "weak_access_token",
-            "host access token must contain at least 32 bytes",
-        ));
-    }
-    let instructions = if config.model.is_some() {
+    let token = config.http.token.clone();
+    let instructions = if config
+        .model
+        .as_ref()
+        .is_some_and(|model| model.api_key().is_some())
+    {
         tokio::task::spawn_blocking({
             let directory = data_dir.clone();
             let workspace = config.workspace.clone();
@@ -131,6 +110,10 @@ pub async fn start(
         let _ = host.shutdown().await;
         return Err(error);
     }
+    if let Err(error) = write_access_token(&data_dir, &token) {
+        let _ = host.shutdown().await;
+        return Err(error);
+    }
     Ok((host, store, token))
 }
 
@@ -139,20 +122,23 @@ pub async fn assemble(config: &HostConfig, instructions: String) -> Result<Compo
     let model = config
         .model
         .as_ref()
+        .filter(|model| model.api_key().is_some())
         .map(|config| -> Result<Arc<dyn TextModel>> {
             Ok(match config {
                 ModelConfig::OpenaiCompatible {
                     endpoint,
                     model,
                     isolation_scope,
-                    api_key_env,
+                    api_key,
                     connect_timeout_ms,
                     max_tokens_field,
                     supports_reasoning_effort,
                 } => {
                     let mut c = openai_compatible::Config::new(
                         endpoint.clone(),
-                        secret(api_key_env)?,
+                        crate::configuration::application::credentials::required(
+                            api_key.as_deref(),
+                        )?,
                         model.clone(),
                         isolation_scope.clone(),
                     );
@@ -165,13 +151,15 @@ pub async fn assemble(config: &HostConfig, instructions: String) -> Result<Compo
                     endpoint,
                     model,
                     isolation_scope,
-                    api_key_env,
+                    api_key,
                     connect_timeout_ms,
                     supports_reasoning,
                 } => {
                     let mut c = openai_responses::Config::new(
                         endpoint.clone(),
-                        secret(api_key_env)?,
+                        crate::configuration::application::credentials::required(
+                            api_key.as_deref(),
+                        )?,
                         model.clone(),
                         isolation_scope.clone(),
                     );
@@ -183,7 +171,7 @@ pub async fn assemble(config: &HostConfig, instructions: String) -> Result<Compo
                     endpoint,
                     model,
                     isolation_scope,
-                    api_key_env,
+                    api_key,
                     connect_timeout_ms,
                     version,
                     supports_adaptive_thinking,
@@ -191,7 +179,9 @@ pub async fn assemble(config: &HostConfig, instructions: String) -> Result<Compo
                 } => {
                     let mut c = anthropic::Config::new(
                         endpoint.clone(),
-                        secret(api_key_env)?,
+                        crate::configuration::application::credentials::required(
+                            api_key.as_deref(),
+                        )?,
                         model.clone(),
                         isolation_scope.clone(),
                     );
@@ -227,81 +217,105 @@ pub async fn assemble(config: &HostConfig, instructions: String) -> Result<Compo
         });
     }
     let speech_enabled = Arc::new(AtomicBool::new(false));
-    let stt: Option<Arc<dyn Stt>> =
-        if let Some(stt) = config.speech.as_ref().and_then(|s| s.stt.as_ref()) {
-            Some(match stt {
-                SttConfig::Sensevoice {
-                    model_path,
-                    tokens_path,
-                } => {
-                    let model = model_path.clone();
-                    let tokens = tokens_path.clone();
-                    Arc::new(
-                        tokio::task::spawn_blocking(move || {
-                            furica_local::asr::SenseVoiceStt::from_files(model, tokens)
-                        })
-                        .await
-                        .map_err(|_| Error::config())??,
-                    )
-                }
-                SttConfig::Aliyun {
-                    endpoint,
-                    model,
-                    api_key_env,
-                } => Arc::new(aliyun::AliyunStt::new(aliyun::SttConfig {
-                    endpoint: endpoint.clone(),
-                    model: model.clone(),
-                    api_key: secret(api_key_env)?,
-                })?),
-                SttConfig::Volcengine {
-                    endpoint,
-                    model,
-                    api_key_env,
-                    resource_id,
-                } => Arc::new(volcengine::VolcengineStt::new(volcengine::SttConfig {
-                    endpoint: endpoint.clone(),
-                    model: model.clone(),
-                    api_key: secret(api_key_env)?,
-                    resource_id: resource_id.clone(),
-                })?),
-            })
-        } else {
-            None
-        };
-    let tts: Option<Arc<dyn Tts>> =
-        if let Some(tts) = config.speech.as_ref().and_then(|s| s.tts.as_ref()) {
-            Some(match tts {
-                TtsConfig::Aliyun {
-                    endpoint,
-                    model,
-                    voice,
-                    api_key_env,
-                } => Arc::new(aliyun::AliyunTts::new(aliyun::TtsConfig {
-                    endpoint: endpoint.clone(),
-                    model: model.clone(),
-                    voice: voice.clone(),
-                    api_key: secret(api_key_env)?,
-                    sample_rate: 16000,
-                })?),
-                TtsConfig::Volcengine {
-                    endpoint,
-                    model,
-                    voice,
-                    api_key_env,
-                    resource_id,
-                } => Arc::new(volcengine::VolcengineTts::new(volcengine::TtsConfig {
-                    endpoint: endpoint.clone(),
-                    model: model.clone(),
-                    voice: voice.clone(),
-                    api_key: secret(api_key_env)?,
-                    sample_rate: 16000,
-                    resource_id: resource_id.clone(),
-                })?),
-            })
-        } else {
-            None
-        };
+    let stt: Option<Arc<dyn Stt>> = if let Some(stt) = config
+        .speech
+        .as_ref()
+        .and_then(|s| s.stt.as_ref())
+        .filter(|stt| match stt {
+            SttConfig::Sensevoice { .. } => true,
+            SttConfig::Aliyun { api_key, .. } | SttConfig::Volcengine { api_key, .. } => {
+                api_key.is_some()
+            }
+        }) {
+        Some(match stt {
+            SttConfig::Sensevoice {
+                model_path,
+                tokens_path,
+            } => {
+                let model = model_path.clone();
+                let tokens = tokens_path.clone();
+                Arc::new(
+                    tokio::task::spawn_blocking(move || {
+                        furica_local::asr::SenseVoiceStt::from_files(model, tokens)
+                    })
+                    .await
+                    .map_err(|_| Error::config())??,
+                )
+            }
+            SttConfig::Aliyun {
+                endpoint,
+                model,
+                api_key,
+            } => Arc::new(aliyun::AliyunStt::new(aliyun::SttConfig {
+                endpoint: endpoint.clone(),
+                model: model.clone(),
+                api_key: crate::configuration::application::credentials::required(
+                    api_key.as_deref(),
+                )?,
+            })?),
+            SttConfig::Volcengine {
+                endpoint,
+                model,
+                api_key,
+                resource_id,
+            } => Arc::new(volcengine::VolcengineStt::new(volcengine::SttConfig {
+                endpoint: endpoint.clone(),
+                model: model.clone(),
+                api_key: crate::configuration::application::credentials::required(
+                    api_key.as_deref(),
+                )?,
+                resource_id: resource_id.clone(),
+            })?),
+        })
+    } else {
+        None
+    };
+    let tts: Option<Arc<dyn Tts>> = if let Some(tts) = config
+        .speech
+        .as_ref()
+        .and_then(|s| s.tts.as_ref())
+        .filter(|tts| match tts {
+            TtsConfig::Aliyun { api_key, .. } | TtsConfig::Volcengine { api_key, .. } => {
+                api_key.is_some()
+            }
+        }) {
+        Some(match tts {
+            TtsConfig::Aliyun {
+                endpoint,
+                model,
+                voice,
+                api_key,
+            } => Arc::new(aliyun::AliyunTts::new(aliyun::TtsConfig {
+                endpoint: endpoint.clone(),
+                model: model.clone(),
+                voice: voice.clone(),
+                api_key: crate::configuration::application::credentials::required(
+                    api_key.as_deref(),
+                )?,
+                sample_rate: 16000,
+            })?),
+            TtsConfig::Volcengine {
+                endpoint,
+                model,
+                voice,
+                api_key,
+                resource_id,
+            } => Arc::new(volcengine::VolcengineTts::new(volcengine::TtsConfig {
+                endpoint: endpoint.clone(),
+                model: model.clone(),
+                voice: voice.clone(),
+                api_key: crate::configuration::application::credentials::required(
+                    api_key.as_deref(),
+                )?,
+                sample_rate: 16000,
+                resource_id: resource_id.clone(),
+            })?),
+        })
+    } else {
+        None
+    };
     let voice_available = model.is_some()
+        && stt.is_some()
         && config
             .speech
             .as_ref()
@@ -360,4 +374,27 @@ pub async fn assemble(config: &HostConfig, instructions: String) -> Result<Compo
         speech_enabled,
         voice_available,
     })
+}
+
+fn write_access_token(directory: &Path, token: &str) -> Result<()> {
+    use std::io::Write;
+    let temporary = directory.join(format!(".access-token-{}", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary).map_err(|_| Error::storage())?;
+        file.write_all(token.as_bytes())
+            .map_err(|_| Error::storage())?;
+        file.sync_all().map_err(|_| Error::storage())?;
+        std::fs::rename(&temporary, directory.join("access-token")).map_err(|_| Error::storage())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }

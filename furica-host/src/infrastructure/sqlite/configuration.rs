@@ -1,5 +1,5 @@
 use crate::{Error, Result, configuration::application::HostConfig};
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
@@ -44,6 +44,33 @@ impl ConfigStore {
                 r.get(0)
             })
             .map_err(|_| Error::storage())?;
+        // Retire the old environment reference without reading it. Generate once,
+        // persist in this transaction, and let clients consume the access-token file.
+        if initialized {
+            let old_reference: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM host_configuration WHERE key='http.token_env')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| Error::storage())?;
+            let direct_token: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM host_configuration WHERE key='http.token')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| Error::storage())?;
+            if old_reference && !direct_token {
+                let token = crate::configuration::application::new_access_token();
+                tx.execute(
+                    "INSERT INTO host_configuration(key,value) VALUES('http.token',?1)",
+                    [serde_json::to_string(&token).map_err(|_| Error::config())?],
+                )
+                .map_err(|_| Error::storage())?;
+            }
+            tx.execute("DELETE FROM host_configuration WHERE key IN ('http.token_env','model.api_key_env','speech.stt.api_key_env','speech.tts.api_key_env')", []).map_err(|_| Error::storage())?;
+        }
         let config = match (initialized, initial) {
             (true, Some(_)) => {
                 return Err(Error::new(
@@ -75,6 +102,19 @@ impl ConfigStore {
     }
     pub fn read(&self) -> Result<HostConfig> {
         read_config(&self.connection()?)
+    }
+    /// Merge masked credentials and replace configuration in one serialized transaction.
+    pub fn save_update(&self, value: Value) -> Result<()> {
+        let mut db = self.connection()?;
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| Error::storage())?;
+        let config =
+            crate::configuration::application::credentials::update(value, &read_config(&tx)?)?;
+        tx.execute("DELETE FROM host_configuration", [])
+            .map_err(|_| Error::storage())?;
+        write_config(&tx, &config)?;
+        tx.commit().map_err(|_| Error::storage())
     }
     pub fn save(&self, config: &HostConfig) -> Result<()> {
         config.validate()?;
@@ -136,7 +176,15 @@ fn read_config(db: &Connection) -> Result<HostConfig> {
         let (key, value) = row.map_err(|_| Error::storage())?;
         // Old databases may still contain this retired field. Reads leave it intact;
         // the next complete save removes it with the other obsolete fields.
-        if key == "instructions" {
+        if key == "instructions"
+            || matches!(
+                key.as_str(),
+                "http.token_env"
+                    | "model.api_key_env"
+                    | "speech.stt.api_key_env"
+                    | "speech.tts.api_key_env"
+            )
+        {
             continue;
         }
         let mut path = key.split('.').peekable();
@@ -157,6 +205,10 @@ fn read_config(db: &Connection) -> Result<HostConfig> {
                 .entry(field)
                 .or_insert_with(|| Value::Object(Map::new()));
         }
+    }
+    // A generated startup token must be committed, never invented by a read.
+    if document.pointer("/http/token").is_none() {
+        return Err(Error::config());
     }
     // Serde applies the existing typed defaults only to missing fields.
     let config: HostConfig = serde_json::from_value(document).map_err(|_| Error::config())?;

@@ -41,7 +41,7 @@ body.panel-open .main-space { margin-right: 340px; padding-right: 32px; padding-
 
 .history-empty { white-space: pre-line; }.more-button { padding: 0; letter-spacing: 0; }
 
-/* Editable service configuration follows the existing settings panel. */
+/* Key/value controls map directly to the existing HostConfig fields. */
 .service-section input:not([type="checkbox"]), .service-section select, .service-section textarea { width: 100%; box-sizing: border-box; background: #fffaf2; border: 1px solid #e0d8c7; border-radius: 8px; padding: 10px 12px; color: var(--ink); font: inherit; }
 .service-section textarea { resize: vertical; min-height: 65px; }
 .service-section input:focus, .service-section textarea:focus, .service-section select:focus { outline: 2px solid #929f84; outline-offset: 2px; }
@@ -54,3 +54,14 @@ body.panel-open .main-space { margin-right: 340px; padding-right: 32px; padding-
 @media (max-width: 480px) { .settings-dialog .settings-body { max-height: 48dvh; } .settings-footer { gap: 8px; } .settings-actions { gap: 4px; flex-shrink: 0; } .settings-actions .primary-button { padding: 10px 16px; } }
 
 .required-marker { margin-left: 8px; font-size: 10px; color: #a3654d; font-weight: 500; }
+
+.settings-field { margin: 18px 0; min-width: 0; }
+.settings-field .field-label { margin: 0 0 5px; }
+.setting-key { display: block; margin: 0 0 8px; color: var(--muted); font: 10px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
+.capability-toggle { display: flex; align-items: center; gap: 8px; margin: 14px 0; }
+.setting-list-item { display: flex; align-items: start; gap: 6px; margin: 7px 0; }
+.setting-list-item input, .setting-list-item textarea { min-width: 0; flex: 1; }
+.setting-list-item textarea { min-height: 40px; }
+.setting-list-item button { flex-shrink: 0; margin-top: 3px; }
+.settings-help { color: var(--muted); font-size: 11px; line-height: 1.9; }
+.settings-field input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--sage); }

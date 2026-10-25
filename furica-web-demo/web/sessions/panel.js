@@ -48,13 +48,13 @@ export class SessionPanel {
         const row = element('div', undefined, 'task-run');
         row.append(element('span', labels[run.state] ?? run.state, 'status-label'));
         const input = (this.data.messages ?? []).find(m => m.id === run.input_message_id);
-        const blocks = input?.content?.Blocks;
-        const prompt = blocks?.map(b => b.text ?? '').join('') || input?.content?.Model?.User;
+        const blocks = input?.content?.blocks;
+        const prompt = blocks?.map(b => b.text ?? '').join('') || input?.content?.text;
         if (prompt) row.append(element('p', prompt));
         if (run.summary || run.error) row.append(element('pre', run.error || run.summary));
-        const messages = (this.data.messages ?? []).filter(m => m.run_id === run.id && m.role === 'Assistant' && m.content?.Blocks).slice(-3);
+        const messages = (this.data.messages ?? []).filter(m => m.run_id === run.id && m.role === 'Assistant' && m.content?.blocks).slice(-3);
         for (const message of messages) {
-          const text = message.content.Blocks.filter(b => b.type === 'text').map(b => b.text ?? '').join('');
+          const text = message.content.blocks.filter(b => b.type === 'text').map(b => b.text ?? '').join('');
           if (text) row.append(element('div', text.slice(0, 8000), 'agent-message'));
         }
         const tools = (this.data.tool_calls ?? []).filter(t => t.run_id === run.id);
@@ -67,8 +67,9 @@ export class SessionPanel {
         const controls = element('div', undefined, 'task-controls');
         controls.append(this.button('交给对话', async () => {
           if (!prompt.value.trim()) return;
-          await this.ask('prepare_next_run', { acp_session_id: session.id, prompt: prompt.value.trim() });
-          this.drafts.delete(`continue-${session.id}`); prompt.value = '';
+          if (await this.ask('prepare_next_run', { acp_session_id: session.id, prompt: prompt.value.trim() })) {
+            this.drafts.delete(`continue-${session.id}`); prompt.value = '';
+          }
         }), this.button('请求取消', () => this.ask('cancel_run', { acp_session_id: session.id }), !runs.some(r => ['prepared', 'queued', 'running'].includes(r.state))), this.button('请求结束', () => this.ask('close_acp_session', { acp_session_id: session.id })));
         card.append(controls);
       }

@@ -15,6 +15,12 @@ fn connection(path: &Path, create: bool) -> Result<Connection> {
         flags |= OpenFlags::SQLITE_OPEN_CREATE;
     }
     let db = Connection::open_with_flags(path, flags).map_err(|_| Error::storage())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| Error::storage())?;
+    }
     db.busy_timeout(std::time::Duration::from_secs(2))
         .map_err(|_| Error::storage())?;
     db.execute_batch("PRAGMA synchronous=FULL;")
