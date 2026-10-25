@@ -9,8 +9,11 @@
 示例中的 `.example` 域名和路径是占位值，不能直接用于真实调用。
 配置 `speech: null` 时文字交互可独立工作，开启语音返回 `voice_unavailable`。
 所选模型必须支持已有的工具调用契约；配置不隐式猜测供应商、账号或模型能力。
+先创建数据目录，并将本目录 `system-prompt.toml` 复制到 `<data-directory>/system-prompt.toml`。
 
 ```sh
+mkdir -p /absolute/path/to/host-data
+cp furica-host/system-prompt.toml /absolute/path/to/host-data/system-prompt.toml
 export FURICA_HOST_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 export FURICA_MODEL_KEY='YOUR_PROVIDER_KEY'
 cargo run -p furica-host -- /absolute/path/to/host-data --initialize /absolute/path/to/config.json
@@ -31,6 +34,33 @@ value 使用 JSON 编码，数组作为一个值保存。读取缺失字段时�
 数据库版本为 4，只支持新建空数据库或打开版本 4；旧版本直接拒绝，不提供迁移或旧 JSON 导入。
 修改数据库不热更新当前组件、凭证、监听地址或 CORS 名单。
 启动时校验配置、加载选中能力和本地文件；云端连接/账号是否有效仍需真实调用验证。
+
+## 系统提示词
+
+数据目录中的 `system-prompt.toml` 是系统提示词的唯一来源，只包含一个字符串 K-V：
+
+```toml
+system = '''
+你是 Furica。默认使用 {{language}}，解释时间时采用 {{timezone}} 时区。
+当前工作目录为 {{workspace}}。
+'''
+```
+
+文件中的多行文本可直接手动编辑，示例还包含系统描述、功能调用策略与结果解释规则。
+文件在每次进程启动时读取，修改后重启生效；文件必须存在、使用 UTF-8、大小不超过 1 MiB。
+格式错误、额外键、非字符串值、空白提示词、未知或未闭合变量会阻止启动。
+渲染后的文本仍受 `limits.max_context_bytes` 约束，模型请求还会统一计算历史和工具定义的预算。
+
+所有变量值和一次替换逻辑集中在 `src/configuration/application/prompts.rs::render_system`：
+`language` 默认“简体中文”，`timezone` 默认 `Asia/Shanghai`，`workspace` 来自现有 HostConfig。
+增加变量或调整默认语言/时区时只需修改该函数；变量值中的模板标记不会再次展开。
+这里的时区提示只影响模型解释时间的约定，不实现时钟或定时任务。
+core 继续接收渲染后的字符串，不读取 TOML 文件。工具参数和可用性仍以本次请求的实际工具定义为准。
+
+`HostConfig.instructions` 已移除，新的初始化 JSON 与配置 API 不再接受该字段。
+读取现有版本 4 数据库时，会忽略遗留的 `instructions` 配置项，下次保存完整配置时将其移除；
+旧提示词如需继续使用，请手动迁入 TOML。系统提示词不再作为 host 配置写入数据库，
+但 core 既有的 System 消息记录仍会保存实际使用的提示词。
 
 ## HTTP 交互
 

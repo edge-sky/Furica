@@ -113,7 +113,15 @@ pub async fn start(
             "host access token must contain at least 32 bytes",
         ));
     }
-    let components = assemble(&config).await?;
+    let instructions = tokio::task::spawn_blocking({
+        let directory = data_dir.clone();
+        let workspace = config.workspace.clone();
+        let max_bytes = config.limits.max_context_bytes;
+        move || crate::infrastructure::prompts::load_system(&directory, &workspace, max_bytes)
+    })
+    .await
+    .map_err(|_| Error::config())??;
+    let components = assemble(&config, instructions).await?;
     let path = data_dir.join("configuration.sqlite3");
     let host = Host::new(config, components, path).await?;
     host.hold_directory_lock(directory_lock).await;
@@ -124,7 +132,7 @@ pub async fn start(
     Ok((host, store, token))
 }
 
-pub async fn assemble(config: &HostConfig) -> Result<Components> {
+pub async fn assemble(config: &HostConfig, instructions: String) -> Result<Components> {
     config.validate()?;
     let model: Arc<dyn TextModel> = match &config.model {
         ModelConfig::OpenaiCompatible {
@@ -286,7 +294,7 @@ pub async fn assemble(config: &HostConfig) -> Result<Components> {
             inference_timeout: Duration::from_millis(l.inference_timeout_ms),
             max_history_messages: l.max_history_messages,
             max_context_bytes: l.max_context_bytes,
-            instructions: config.instructions.clone(),
+            instructions: Some(instructions),
             max_output_tokens: l.max_output_tokens,
             reasoning: None,
         },

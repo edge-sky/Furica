@@ -1,3 +1,5 @@
+pub mod prompts;
+
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
@@ -12,7 +14,6 @@ pub struct HostConfig {
     pub acp: AcpConfig,
     #[serde(default)]
     pub limits: RuntimeLimits,
-    pub instructions: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -285,10 +286,6 @@ impl HostConfig {
             || l.upload_retry_window_ms > 30_000
             || l.context_max_bytes == 0
             || l.context_max_bytes > 1024 * 1024 * 1024
-            || self
-                .instructions
-                .as_ref()
-                .is_some_and(|s| s.len() > l.max_context_bytes)
             || self.http.allowed_origins.len() > 32
             || self.http.allowed_origins.iter().any(|s| !valid_origin(s))
         {

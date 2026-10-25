@@ -30,7 +30,7 @@ HTTP 投影排除模型原始 continuation。PlaybackPosition、PlaybackChunk �
 
 | 部分/对象 | 字段及含义 |
 | --- | --- |
-| `HostConfig` | `http`、`workspace`（绝对路径）、`model`、`speech`（可空）、`acp`、`limits`、`instructions`（可空） |
+| `HostConfig` | `http`、`workspace`（绝对路径）、`model`、`speech`（可空）、`acp`、`limits` |
 | `HttpConfig` | `listen`（回环 IP 与端口）、`token_env`（非空环境变量名）、`allowed_origins`（完整 origin 列表，默认空） |
 | `ModelConfig` | `protocol`（`openai_compatible` / `openai_responses` / `anthropic`）、`endpoint`、`model`、`isolation_scope`、`api_key_env`、`connect_timeout_ms` |
 | 模型协议选项 | compatible：`max_tokens_field`、`supports_reasoning_effort`；responses：`supports_reasoning`；anthropic：`version`、`supports_adaptive_thinking`、`supports_thinking_budget`。按 protocol 定义带标签枚举，不接受不适用字段 |
@@ -58,6 +58,13 @@ SQLite 使用 `PRAGMA user_version=4`，只支持新建空库或打开版本 4�
 
 配置更新先验证结构和静态边界，再提交；报告 `restart_required=true`，不热应用。
 配置中仅保存凭证环境变量名；访问令牌与供应商密钥不写数据库、事件或日志。
+
+系统提示词以数据目录中的 `system-prompt.toml` 为唯一来源，使用单个 `system` 字符串 K-V。
+文件只包含提示词工程文本；语言、时区和工作目录的变量值与一次替换集中在
+`configuration/application/prompts.rs::render_system`，文件读取及 TOML 解析位于 `infrastructure/prompts.rs`。
+bootstrap 在启动时读取并渲染，再将结果传给现有 CascadeConfig.instructions；编辑后重启生效。
+移除 HostConfig.instructions；现有版本 4 数据库读取时忽略遗留的 instructions 项，保存完整配置时清理。
+配置 API 和初始化 JSON 不再接受旧字段，不修改会话记录或 core 的系统消息记录机制。
 
 ## 3. HTTP 公共对象
 

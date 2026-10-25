@@ -26,6 +26,5 @@
     "cancel_timeout_ms": 5000,
     "idle_timeout_ms": 1800000
   },
-  "limits": {},
-  "instructions": null
+  "limits": {}
 }

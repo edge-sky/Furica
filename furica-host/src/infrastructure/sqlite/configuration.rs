@@ -134,6 +134,11 @@ fn read_config(db: &Connection) -> Result<HostConfig> {
     let mut document = Value::Object(Map::new());
     for row in rows {
         let (key, value) = row.map_err(|_| Error::storage())?;
+        // Old databases may still contain this retired field. Reads leave it intact;
+        // the next complete save removes it with the other obsolete fields.
+        if key == "instructions" {
+            continue;
+        }
         let mut path = key.split('.').peekable();
         let mut current = &mut document;
         while let Some(field) = path.next() {
