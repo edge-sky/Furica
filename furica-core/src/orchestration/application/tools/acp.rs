@@ -8,6 +8,8 @@ use uuid::Uuid;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Start {
+    agent_id: String,
+    workspace_id: String,
     prompt: String,
 }
 #[derive(Deserialize)]
@@ -65,14 +67,17 @@ pub(super) fn entries() -> Vec<ToolEntry> {
         tool(
             "prepare_run",
             "Request an ACP session and its first execution. Core starts it after the host saves and acknowledges the prepared data. Preparation alone does not start work.",
-            json!({"prompt": prompt()}),
-            json!(["prompt"]),
+            json!({"agent_id": {"type":"string"}, "workspace_id": {"type":"string"}, "prompt": prompt()}),
+            json!(["agent_id", "workspace_id", "prompt"]),
             |tools, call, _speech| {
                 let args: Start = serde_json::from_value(call.arguments.clone())?;
-                let run =
-                    tools
-                        .sessions
-                        .prepare_start(tools.session_id, &call.call_id, args.prompt)?;
+                let run = tools.sessions.prepare_selected(
+                    tools.session_id,
+                    &call.call_id,
+                    &args.agent_id,
+                    &args.workspace_id,
+                    args.prompt,
+                )?;
                 Ok(json!({
                     "acp_session_id": run.acp_session_id,
                     "run_id": run.id,
@@ -179,7 +184,7 @@ pub(super) fn entries() -> Vec<ToolEntry> {
         ),
         tool(
             "close_acp_session",
-            "Close the ACP session and release its agent process. Pending questions are cancelled and no new rounds are accepted.",
+            "Close the ACP session and release its resources after confirmation. Shared connections may remain alive. Pending questions are cancelled and no new rounds are accepted.",
             json!({"acp_session_id": uuid()}),
             json!(["acp_session_id"]),
             |tools, call, _speech| {

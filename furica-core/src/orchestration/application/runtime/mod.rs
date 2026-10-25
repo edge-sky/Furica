@@ -385,6 +385,15 @@ impl Actor {
 
     fn route_execution_event(&mut self, event: &SessionEvent) -> Result<()> {
         match event {
+            SessionEvent::AcpSessionChanged(session)
+                if session.session_id == self.session_id
+                    && (session.state.is_terminal() || session.error.is_some()) =>
+            {
+                self.push_execution_result(json!({
+                    "kind": "acp_session", "acp_session_id": session.id,
+                    "state": session.state, "error": session.error,
+                }));
+            }
             SessionEvent::RunChanged { session_id, run }
                 if *session_id == self.session_id && run.state.is_terminal() =>
             {

@@ -11,7 +11,7 @@ use crate::{
 use furica_core::{
     orchestration::{Core, CoreEvent, CoreHandle, CoreState, VoiceBackend},
     playback::{PlaybackChunk, PlaybackState},
-    sessions::{Executor, SessionData, SessionManager},
+    sessions::{AgentBinding, SessionData, SessionManager},
 };
 use serde_json::{Value, json};
 use sessions::switching_allowed;
@@ -33,7 +33,7 @@ use voice_lease::VoiceLease;
 
 pub struct Components {
     pub backend: Arc<dyn VoiceBackend>,
-    pub executor: Arc<dyn Executor>,
+    pub agents: Vec<AgentBinding>,
     pub speech_enabled: Arc<AtomicBool>,
     pub voice_available: bool,
 }
@@ -99,10 +99,9 @@ impl Host {
             })
             .await
             .map_err(|_| Error::storage())??;
-            let manager = SessionManager::new(
+            let manager = SessionManager::with_agents(
                 data,
-                components.executor.clone(),
-                config.workspace.clone(),
+                components.agents.clone(),
                 config.session_limits(),
             )?;
             delivery::receive(&manager, store.clone(), receiver_serial.clone()).await?;
@@ -114,10 +113,9 @@ impl Host {
             .await
             .map_err(|_| Error::storage())??;
         }
-        let manager = SessionManager::new(
+        let manager = SessionManager::with_agents(
             SessionData::default(),
-            components.executor.clone(),
-            config.workspace.clone(),
+            components.agents.clone(),
             config.session_limits(),
         )?;
         let (events, _) = broadcast::channel(config.limits.channel_capacity);

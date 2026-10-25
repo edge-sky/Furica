@@ -25,10 +25,9 @@ impl Host {
         let stream = state.manager.delivery_id();
         self.database(move |store| store.finish_delivery(stream))
             .await?;
-        state.manager = SessionManager::new(
+        state.manager = SessionManager::with_agents(
             SessionData::default(),
-            self.components.executor.clone(),
-            self.config.workspace.clone(),
+            self.components.agents.clone(),
             self.config.session_limits(),
         )?;
         state.selected = None;
@@ -194,9 +193,14 @@ impl Host {
         } else {
             Ok(())
         };
+        let mut executors = Ok(());
+        for agent in &self.components.agents {
+            let result = agent.executor.shutdown().await.map_err(Into::into);
+            executors = executors.and(result);
+        }
         self.stop_receiver(&mut state).await;
         let saved = self.receive_messages(&state.manager).await;
-        voice.and(runtime).and(manager).and(saved)?;
+        voice.and(runtime).and(manager).and(executors).and(saved)?;
         let stream = state.manager.delivery_id();
         self.database(move |store| store.finish_delivery(stream))
             .await

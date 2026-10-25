@@ -25,6 +25,24 @@ pub(super) struct CoreTools {
 impl CoreTools {
     pub(super) fn new(sessions: SessionManager, session_id: Uuid, speech: bool) -> Self {
         let mut entries = acp::entries();
+        let candidates: Vec<_> = sessions.agents().iter().map(|agent| json!({
+            "agent_id": agent.id, "description": agent.description,
+            "workspaces": agent.workspaces.iter().map(|w| json!({"workspace_id":w.id,"description":w.description})).collect::<Vec<_>>()
+        })).collect();
+        if let Some(start) = entries
+            .iter_mut()
+            .find(|e| e.definition.name == "prepare_run")
+        {
+            start
+                .definition
+                .description
+                .as_mut()
+                .unwrap()
+                .push_str(&format!(
+                    " Available agent/workspace candidates: {}",
+                    json!(candidates)
+                ));
+        }
         if speech {
             entries.push(speech::entry());
         }

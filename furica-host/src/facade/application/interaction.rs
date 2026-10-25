@@ -24,10 +24,9 @@ impl Host {
         }
         self.stop_receiver(state).await;
         let data = self.database(move |store| store.context(id)).await?;
-        state.manager = SessionManager::new(
+        state.manager = SessionManager::with_agents(
             data,
-            self.components.executor.clone(),
-            self.config.workspace.clone(),
+            self.components.agents.clone(),
             self.config.session_limits(),
         )?;
         self.receive_messages(&state.manager).await?;

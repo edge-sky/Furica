@@ -313,7 +313,16 @@ pub async fn assemble(config: &HostConfig, instructions: String) -> Result<Compo
     };
     Ok(Components {
         backend,
-        executor,
+        agents: vec![furica_core::sessions::AgentBinding {
+            id: c.agent_id.clone(),
+            description: "Configured coding agent".into(),
+            executor,
+            workspaces: vec![furica_core::sessions::WorkspaceOption {
+                id: "default".into(),
+                description: "Configured agent workspace".into(),
+                path: config.workspace.clone(),
+            }],
+        }],
         speech_enabled,
         voice_available: config.speech.is_some(),
     })

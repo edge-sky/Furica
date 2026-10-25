@@ -24,6 +24,7 @@ use super::super::{
     },
     ports::{ExecutionEvent, ExecutionInput, Executor},
 };
+use super::bindings::{AgentBinding, WorkspaceOption};
 use super::data::SessionData;
 use super::state::{Memory, push_message, require_active};
 use crate::text_model::ModelMessage;
@@ -31,7 +32,7 @@ use crate::{Error, Result};
 
 #[derive(Clone, Debug)]
 pub struct SessionLimits {
-    /// Concurrent ACP sessions, each backed by one agent process.
+    /// Concurrent ACP sessions; the executor owns their connection allocation.
     pub max_acp_sessions: usize,
     /// Prepared, queued and running rounds across all sessions.
     pub max_runs: usize,
@@ -74,8 +75,7 @@ struct Inner {
     data: Memory,
     delivery_id: Uuid,
     acknowledgements: Mutex<()>,
-    executor: Arc<dyn Executor>,
-    workspace: PathBuf,
+    agents: Vec<AgentBinding>,
     limits: SessionLimits,
     connections: Mutex<HashMap<Uuid, SessionControl>>,
     questions: Mutex<HashMap<Uuid, PendingQuestion>>,
@@ -114,8 +114,43 @@ impl SessionManager {
         workspace: PathBuf,
         limits: SessionLimits,
     ) -> Result<Self> {
-        if !workspace.is_absolute() {
-            return Err(Error::Config("workspace must be absolute".into()));
+        Self::with_agents(
+            data,
+            vec![AgentBinding {
+                id: executor.agent_id().to_owned(),
+                description: "Default agent".into(),
+                executor,
+                workspaces: vec![WorkspaceOption {
+                    id: "default".into(),
+                    description: "Default workspace".into(),
+                    path: workspace,
+                }],
+            }],
+            limits,
+        )
+    }
+
+    pub fn with_agents(
+        data: SessionData,
+        agents: Vec<AgentBinding>,
+        limits: SessionLimits,
+    ) -> Result<Self> {
+        let mut ids = HashSet::new();
+        for agent in &agents {
+            if agent.id.trim().is_empty() || !ids.insert(&agent.id) || agent.workspaces.is_empty() {
+                return Err(Error::Config("invalid or duplicate agent binding".into()));
+            }
+            let mut workspaces = HashSet::new();
+            for workspace in &agent.workspaces {
+                if workspace.id.trim().is_empty()
+                    || !workspaces.insert(&workspace.id)
+                    || !workspace.path.is_absolute()
+                {
+                    return Err(Error::Config(
+                        "invalid or duplicate workspace option".into(),
+                    ));
+                }
+            }
         }
         if limits.max_acp_sessions == 0
             || limits.max_acp_sessions > 64
@@ -131,8 +166,7 @@ impl SessionManager {
             data,
             delivery_id: Uuid::new_v4(),
             acknowledgements: Mutex::new(()),
-            executor,
-            workspace,
+            agents,
             limits,
             connections: Mutex::new(HashMap::new()),
             questions: Mutex::new(HashMap::new()),
@@ -141,6 +175,11 @@ impl SessionManager {
             idle: Notify::new(),
             events,
         })))
+    }
+
+    /// Immutable candidates supplied by the host for model selection.
+    pub fn agents(&self) -> &[AgentBinding] {
+        &self.0.agents
     }
 
     #[cfg(test)]
@@ -268,12 +307,25 @@ impl SessionManager {
 
     /// Main-model tool entry point. Only prepare data; the host must receive and
     /// acknowledge its ordered messages before Core starts execution.
-    pub(crate) fn prepare_start(
+    pub(crate) fn prepare_selected(
         &self,
         session_id: Uuid,
         call_id: &str,
+        agent_id: &str,
+        workspace_id: &str,
         prompt: String,
     ) -> Result<Run> {
+        let agent = self
+            .0
+            .agents
+            .iter()
+            .find(|a| a.id == agent_id)
+            .ok_or_else(|| Error::Config("unknown agent id".into()))?;
+        let workspace = agent
+            .workspaces
+            .iter()
+            .find(|w| w.id == workspace_id)
+            .ok_or_else(|| Error::Config("workspace is not available for this agent".into()))?;
         self.validate_request(session_id, call_id, &prompt)?;
         if self.0.shutdown.is_cancelled() {
             return Err(Error::Closed);
@@ -287,7 +339,12 @@ impl SessionManager {
         }
         let key = request_key(session_id, call_id);
         if let Some(run) = self.0.data.find_run_by_request(&key)? {
-            if run.session_id != session_id || self.0.data.prompt(run.id)? != prompt {
+            let bound = self.0.data.get_session(run.acp_session_id)?;
+            if run.session_id != session_id
+                || self.0.data.prompt(run.id)? != prompt
+                || bound.agent_id != agent_id
+                || bound.workspace != workspace.path
+            {
                 return Err(Error::State(
                     "request key reused for different content".into(),
                 ));
@@ -300,8 +357,8 @@ impl SessionManager {
             session_id,
             remote_session_id: None,
             state: AcpSessionState::Opening,
-            workspace: self.0.workspace.clone(),
-            agent_id: self.0.executor.agent_id().to_owned(),
+            workspace: workspace.path.clone(),
+            agent_id: agent.id.clone(),
             created_at_ms: now,
             updated_at_ms: now,
             last_activity_ms: now,
@@ -340,6 +397,23 @@ impl SessionManager {
             run: run.clone(),
         });
         Ok(run)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_start(
+        &self,
+        session_id: Uuid,
+        call_id: &str,
+        prompt: String,
+    ) -> Result<Run> {
+        let agent = &self.0.agents[0];
+        self.prepare_selected(
+            session_id,
+            call_id,
+            &agent.id,
+            &agent.workspaces[0].id,
+            prompt,
+        )
     }
 
     pub(crate) fn prepare_continue(
@@ -469,7 +543,14 @@ impl SessionManager {
         });
         if let Some((input_rx, event_tx, event_rx)) = spawn {
             let manager = self.clone();
-            let executor = self.0.executor.clone();
+            let executor = self
+                .0
+                .agents
+                .iter()
+                .find(|a| a.id == acp.agent_id)
+                .ok_or_else(|| Error::Config("session agent binding is unavailable".into()))?
+                .executor
+                .clone();
             let cancel = self.0.shutdown.child_token();
             runtime.spawn(async move {
                 manager
@@ -628,7 +709,7 @@ impl SessionManager {
         let session = self.0.data.get_session(session_id)?;
         self.require_owner(&session, owner_id)?;
         self.cancel_prepared(Some(owner_id), Some(session_id))?;
-        if session.state == AcpSessionState::Closed {
+        if session.state.is_terminal() {
             return Ok(session);
         }
         let input = {
@@ -649,17 +730,7 @@ impl SessionManager {
         let record = self.0.data.update_session(session_id, |session| {
             session.request_close();
         })?;
-        if input.send(ExecutionInput::Close).is_err() {
-            if let Ok(mut sessions) = self.lock_connections() {
-                sessions.remove(&session_id);
-            }
-            let record = self.0.data.update_session(session_id, |session| {
-                session.closed();
-            })?;
-            self.cancel_questions_for_session(session_id, QuestionState::Cancelled, false);
-            self.emit(SessionEvent::AcpSessionChanged(record.clone()));
-            return Ok(record);
-        }
+        let _ = input.send(ExecutionInput::Close);
         self.cancel_questions_for_session(session_id, QuestionState::Cancelled, true);
         self.emit(SessionEvent::AcpSessionChanged(record.clone()));
         Ok(record)
@@ -728,6 +799,8 @@ impl SessionManager {
             for s in &mut d.acp_sessions {
                 if owner.is_none_or(|id| id == s.session_id)
                     && acp.is_none_or(|id| id == s.id)
+                    && s.state == AcpSessionState::Opening
+                    && s.remote_session_id.is_none()
                     && !connections.contains_key(&s.id)
                     && !d
                         .runs
@@ -818,6 +891,13 @@ impl SessionManager {
             Ok(run)
         };
         match event {
+            ExecutionEvent::CloseFailed { error } => {
+                let record = self.0.data.update_session(acp_session_id, |s| {
+                    s.request_close();
+                    s.error = Some(error.chars().take(8192).collect());
+                })?;
+                self.emit(SessionEvent::AcpSessionChanged(record));
+            }
             ExecutionEvent::Opened { remote_session_id } => {
                 let record = self.0.data.update_session(acp_session_id, |s| {
                     s.opened(remote_session_id);
@@ -1240,17 +1320,7 @@ impl SessionManager {
             (record, failed)
         };
         self.emit(SessionEvent::AcpSessionChanged(record));
-        if send_failed {
-            if let Ok(mut sessions) = self.lock_connections() {
-                sessions.remove(&session_id);
-            }
-            if let Ok(record) = self.0.data.update_session(session_id, |session| {
-                session.closed();
-            }) {
-                self.cancel_questions_for_session(session_id, QuestionState::Cancelled, false);
-                self.emit(SessionEvent::AcpSessionChanged(record));
-            }
-        }
+        let _ = send_failed; // The supervisor confirms cleanup, even if the input channel closed.
     }
 
     fn finalize_session(&self, session_id: Uuid, result: Result<()>) -> Result<()> {
@@ -1305,7 +1375,21 @@ impl SessionManager {
                 });
             }
         }
-        for run in self.0.data.list_runs(session_id)? {
+        for mut run in self.0.data.list_runs(session_id)? {
+            if !run.state.is_terminal() {
+                run = self.0.data.update_run(run.id, |r| match &result {
+                    Err(error) => {
+                        r.interrupt(error.to_string());
+                    }
+                    Ok(()) => {
+                        r.cancel_before_start("session_closed_before_execution");
+                    }
+                })?;
+                self.emit(SessionEvent::RunChanged {
+                    session_id: session.session_id,
+                    run: run.clone(),
+                });
+            }
             self.0
                 .data
                 .finish_messages(run.id, run.state != RunState::Completed)?;

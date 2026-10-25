@@ -13,7 +13,7 @@ pub struct AcpConfig {
     pub run_timeout: Duration,
     /// Time allowed for the agent to confirm cancellation or session close.
     pub cancel_timeout: Duration,
-    /// Idle sessions are released after this period without a round.
+    /// Connections with no open sessions are released after this period.
     pub idle_timeout: Duration,
 }
 

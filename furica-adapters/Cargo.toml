@@ -7,7 +7,7 @@ description = "Replaceable speech and text capability implementations for Furica
 license = "MIT"
 
 [features]
-acp = ["dep:agent-client-protocol", "dep:serde_json", "dep:uuid", "tokio/process", "tokio/io-util"]
+acp = ["dep:futures-util", "dep:agent-client-protocol", "dep:serde_json", "dep:uuid", "tokio/process", "tokio/io-util"]
 default = []
 http = ["dep:bytes", "dep:reqwest", "dep:serde_json", "dep:futures-util"]
 cloud = ["http", "dep:base64"]

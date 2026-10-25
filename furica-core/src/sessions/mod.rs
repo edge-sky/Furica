@@ -2,6 +2,6 @@
 mod application;
 pub mod domain;
 pub mod ports;
-pub use application::{SessionData, SessionLimits, SessionManager};
+pub use application::{AgentBinding, SessionData, SessionLimits, SessionManager, WorkspaceOption};
 pub use domain::*;
 pub use ports::{ExecutionEvent, ExecutionInput, Executor};

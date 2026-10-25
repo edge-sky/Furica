@@ -46,13 +46,12 @@ impl Host {
     async fn context_manager(&self, id: Uuid) -> Result<SessionManager> {
         let session = self.database(move |store| store.session(id)).await?;
         // Metadata commands need only the owner; historical records remain in the database.
-        Ok(SessionManager::new(
+        Ok(SessionManager::with_agents(
             SessionData {
                 sessions: vec![session],
                 ..Default::default()
             },
-            self.components.executor.clone(),
-            self.config.workspace.clone(),
+            self.components.agents.clone(),
             self.config.session_limits(),
         )?)
     }
