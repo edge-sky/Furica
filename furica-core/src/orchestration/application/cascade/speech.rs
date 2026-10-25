@@ -88,7 +88,10 @@ impl SpeechQueue {
                 tokio::time::timeout(
                     backend.config.inference_timeout,
                     tts::synthesize(
-                        backend.tts.as_ref(),
+                        backend
+                            .tts
+                            .as_deref()
+                            .ok_or_else(|| Error::State("TTS is unavailable".into()))?,
                         text,
                         backend.config.sample_rate,
                         backend.config.max_generated_audio,

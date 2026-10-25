@@ -1,4 +1,5 @@
 pub mod prompts;
+pub mod runtime;
 
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -9,9 +10,9 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 pub struct HostConfig {
     pub http: HttpConfig,
     pub workspace: PathBuf,
-    pub model: ModelConfig,
+    pub model: Option<ModelConfig>,
     pub speech: Option<SpeechConfig>,
-    pub acp: AcpConfig,
+    pub acp: Option<AcpConfig>,
     #[serde(default)]
     pub limits: RuntimeLimits,
 }
@@ -70,9 +71,9 @@ pub enum ModelConfig {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpeechConfig {
-    pub vad_model: PathBuf,
-    pub stt: SttConfig,
-    pub tts: TtsConfig,
+    pub vad_model: Option<PathBuf>,
+    pub stt: Option<SttConfig>,
+    pub tts: Option<TtsConfig>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -246,44 +247,8 @@ impl HostConfig {
         if !self.http.listen.ip().is_loopback()
             || !env_name(&self.http.token_env)
             || !self.workspace.is_absolute()
-            || !self.acp.command.is_absolute()
-            || !present(&self.acp.agent_id)
-            || self.acp.args.len() > 128
-            || self.acp.args.iter().any(|s| s.len() > 8192)
-            || self.acp.auth_method.as_ref().is_some_and(|s| !present(s))
-            || [
-                self.acp.handshake_timeout_ms,
-                self.acp.run_timeout_ms,
-                self.acp.cancel_timeout_ms,
-                self.acp.idle_timeout_ms,
-                l.connect_timeout_ms,
-                l.idle_timeout_ms,
-                l.inference_timeout_ms,
-                l.question_timeout_ms,
-            ]
-            .iter()
-            .any(|value| *value == 0 || *value > 86_400_000)
             || l.channel_capacity == 0
             || l.channel_capacity > 4096
-            || l.max_history_messages == 0
-            || l.max_history_messages > 4096
-            || l.max_context_bytes == 0
-            || l.max_context_bytes > 4 * 1024 * 1024
-            || l.max_output_tokens == 0
-            || l.max_utterance_ms == 0
-            || l.max_utterance_ms > 120_000
-            || l.max_generated_audio_ms == 0
-            || l.max_generated_audio_ms > 120_000
-            || l.max_acp_sessions == 0
-            || l.max_acp_sessions > 64
-            || l.max_runs == 0
-            || l.max_runs > 1024
-            || l.heartbeat_timeout_ms <= 5000
-            || l.heartbeat_timeout_ms > 300_000
-            || l.upload_retry_limit == 0
-            || l.upload_retry_limit > 32
-            || l.upload_retry_window_ms == 0
-            || l.upload_retry_window_ms > 30_000
             || l.context_max_bytes == 0
             || l.context_max_bytes > 1024 * 1024 * 1024
             || self.http.allowed_origins.len() > 32
@@ -291,125 +256,192 @@ impl HostConfig {
         {
             return Err(Error::config());
         }
-        let (url, name, scope, key, timeout) = match &self.model {
-            ModelConfig::OpenaiCompatible {
-                endpoint,
-                model,
-                isolation_scope,
-                api_key_env,
-                connect_timeout_ms,
-                max_tokens_field,
-                ..
-            } => {
-                if !matches!(
-                    max_tokens_field.as_str(),
-                    "max_tokens" | "max_completion_tokens"
-                ) {
-                    return Err(Error::config());
-                }
-                (
-                    endpoint,
-                    model,
-                    isolation_scope,
-                    api_key_env,
-                    connect_timeout_ms,
-                )
-            }
-            ModelConfig::OpenaiResponses {
-                endpoint,
-                model,
-                isolation_scope,
-                api_key_env,
-                connect_timeout_ms,
-                ..
-            } => (
-                endpoint,
-                model,
-                isolation_scope,
-                api_key_env,
-                connect_timeout_ms,
-            ),
-            ModelConfig::Anthropic {
-                endpoint,
-                model,
-                isolation_scope,
-                api_key_env,
-                connect_timeout_ms,
-                version,
-                ..
-            } => {
-                if !present(version) {
-                    return Err(Error::config());
-                }
-                (
-                    endpoint,
-                    model,
-                    isolation_scope,
-                    api_key_env,
-                    connect_timeout_ms,
-                )
-            }
-        };
-        if !endpoint(url)
-            || !present(name)
-            || !present(scope)
-            || !env_name(key)
-            || *timeout == 0
-            || *timeout > 86_400_000
-        {
-            return Err(Error::config());
-        }
-        if let Some(s) = &self.speech {
-            if !s.vad_model.is_absolute() {
+        if let Some(acp) = &self.acp {
+            if !acp.command.is_absolute()
+                || !present(&acp.agent_id)
+                || acp.args.len() > 128
+                || acp.args.iter().any(|s| s.len() > 8192)
+                || acp.auth_method.as_ref().is_some_and(|s| !present(s))
+                || [
+                    acp.handshake_timeout_ms,
+                    acp.run_timeout_ms,
+                    acp.cancel_timeout_ms,
+                    acp.idle_timeout_ms,
+                ]
+                .iter()
+                .any(|value| !timeout(*value))
+            {
                 return Err(Error::config());
             }
-            match &s.stt {
-                SttConfig::Sensevoice {
-                    model_path,
-                    tokens_path,
-                } if !model_path.is_absolute() || !tokens_path.is_absolute() => {
-                    return Err(Error::config());
-                }
-                SttConfig::Aliyun {
-                    endpoint: url,
+            runtime::validate_session_limits(&self.session_limits())?;
+        }
+        if let Some(model) = &self.model {
+            let (url, name, scope, key, connect_timeout) = match model {
+                ModelConfig::OpenaiCompatible {
+                    endpoint,
                     model,
+                    isolation_scope,
                     api_key_env,
-                }
-                | SttConfig::Volcengine {
-                    endpoint: url,
-                    model,
-                    api_key_env,
-                    ..
-                } if !endpoint(url) || !present(model) || !env_name(api_key_env) => {
-                    return Err(Error::config());
-                }
-                _ => (),
-            }
-            match &s.tts {
-                TtsConfig::Aliyun {
-                    endpoint: url,
-                    model,
-                    voice,
-                    api_key_env,
-                }
-                | TtsConfig::Volcengine {
-                    endpoint: url,
-                    model,
-                    voice,
-                    api_key_env,
+                    connect_timeout_ms,
+                    max_tokens_field,
                     ..
                 } => {
-                    if !provider_endpoint(url, matches!(s.tts, TtsConfig::Aliyun { .. }))
-                        || !present(model)
-                        || !present(voice)
-                        || !env_name(api_key_env)
-                    {
+                    if !matches!(
+                        max_tokens_field.as_str(),
+                        "max_tokens" | "max_completion_tokens"
+                    ) {
                         return Err(Error::config());
                     }
+                    (
+                        endpoint,
+                        model,
+                        isolation_scope,
+                        api_key_env,
+                        connect_timeout_ms,
+                    )
+                }
+                ModelConfig::OpenaiResponses {
+                    endpoint,
+                    model,
+                    isolation_scope,
+                    api_key_env,
+                    connect_timeout_ms,
+                    ..
+                } => (
+                    endpoint,
+                    model,
+                    isolation_scope,
+                    api_key_env,
+                    connect_timeout_ms,
+                ),
+                ModelConfig::Anthropic {
+                    endpoint,
+                    model,
+                    isolation_scope,
+                    api_key_env,
+                    connect_timeout_ms,
+                    version,
+                    ..
+                } => {
+                    if !present(version) {
+                        return Err(Error::config());
+                    }
+                    (
+                        endpoint,
+                        model,
+                        isolation_scope,
+                        api_key_env,
+                        connect_timeout_ms,
+                    )
+                }
+            };
+            if !endpoint(url)
+                || !present(name)
+                || !present(scope)
+                || !env_name(key)
+                || !timeout(*connect_timeout)
+                || !timeout(l.connect_timeout_ms)
+                || !timeout(l.idle_timeout_ms)
+                || !timeout(l.inference_timeout_ms)
+                || l.max_history_messages == 0
+                || l.max_history_messages > 4096
+                || l.max_context_bytes == 0
+                || l.max_context_bytes > 4 * 1024 * 1024
+                || l.max_output_tokens == 0
+            {
+                return Err(Error::config());
+            }
+            runtime::validate_core(&self.core_config())?;
+        }
+        if let Some(speech) = &self.speech {
+            if speech
+                .vad_model
+                .as_ref()
+                .is_some_and(|path| !path.is_absolute())
+            {
+                return Err(Error::config());
+            }
+            if let Some(stt) = &speech.stt {
+                if !timeout(l.inference_timeout_ms)
+                    || l.max_utterance_ms == 0
+                    || l.max_utterance_ms > 120_000
+                    || l.max_context_bytes == 0
+                    || l.max_context_bytes > 4 * 1024 * 1024
+                {
+                    return Err(Error::config());
+                }
+                match stt {
+                    SttConfig::Sensevoice {
+                        model_path,
+                        tokens_path,
+                    } => {
+                        if !model_path.is_absolute() || !tokens_path.is_absolute() {
+                            return Err(Error::config());
+                        }
+                    }
+                    SttConfig::Aliyun {
+                        endpoint: url,
+                        model,
+                        api_key_env,
+                    }
+                    | SttConfig::Volcengine {
+                        endpoint: url,
+                        model,
+                        api_key_env,
+                        ..
+                    } => {
+                        if !endpoint(url) || !present(model) || !env_name(api_key_env) {
+                            return Err(Error::config());
+                        }
+                    }
+                }
+                if matches!(stt, SttConfig::Volcengine { resource_id, .. } if !present(resource_id))
+                {
+                    return Err(Error::config());
                 }
             }
-            if matches!(&s.stt, SttConfig::Volcengine {resource_id,..} if !present(resource_id))
-                || matches!(&s.tts, TtsConfig::Volcengine {resource_id,..} if !present(resource_id))
+            if let Some(tts) = &speech.tts {
+                if !timeout(l.inference_timeout_ms)
+                    || l.max_generated_audio_ms == 0
+                    || l.max_generated_audio_ms > 120_000
+                    || l.max_context_bytes == 0
+                    || l.max_context_bytes > 4 * 1024 * 1024
+                {
+                    return Err(Error::config());
+                }
+                let (url, model, voice, api_key_env) = match tts {
+                    TtsConfig::Aliyun {
+                        endpoint,
+                        model,
+                        voice,
+                        api_key_env,
+                    }
+                    | TtsConfig::Volcengine {
+                        endpoint,
+                        model,
+                        voice,
+                        api_key_env,
+                        ..
+                    } => (endpoint, model, voice, api_key_env),
+                };
+                if !provider_endpoint(url, matches!(tts, TtsConfig::Aliyun { .. }))
+                    || !present(model)
+                    || !present(voice)
+                    || !env_name(api_key_env)
+                    || matches!(tts, TtsConfig::Volcengine { resource_id, .. } if !present(resource_id))
+                {
+                    return Err(Error::config());
+                }
+            }
+            if speech.vad_model.is_some()
+                && speech.stt.is_some()
+                && self.model.is_some()
+                && (l.heartbeat_timeout_ms <= 5000
+                    || l.heartbeat_timeout_ms > 300_000
+                    || l.upload_retry_limit == 0
+                    || l.upload_retry_limit > 32
+                    || l.upload_retry_window_ms == 0
+                    || l.upload_retry_window_ms > 30_000)
             {
                 return Err(Error::config());
             }
@@ -444,4 +476,8 @@ fn valid_origin(value: &str) -> bool {
         && !authority
             .chars()
             .any(|c| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '@' | '*'))
+}
+
+fn timeout(value: u64) -> bool {
+    value > 0 && value <= 86_400_000
 }

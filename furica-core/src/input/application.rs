@@ -1,7 +1,6 @@
 //! Input capability assembly, limits and per-input collection bookkeeping.
 
 use super::{SpeakerVerifier, Vad};
-use crate::{Error, Result, config::CoreConfig};
 use std::{sync::Arc, time::Duration};
 
 #[derive(Clone, Debug)]
@@ -27,20 +26,6 @@ pub struct SpeechInput {
     pub vad: Arc<dyn Vad>,
     pub speaker: Arc<dyn SpeakerVerifier>,
     pub config: InputConfig,
-}
-
-impl SpeechInput {
-    pub(crate) fn validate(&self, core: &CoreConfig) -> Result<()> {
-        if self.config.verification_window.is_zero()
-            || self.config.verification_window >= core.connect_buffer
-            || self.config.verification_timeout.is_zero()
-            || self.config.endpoint_silence.is_zero()
-            || self.config.endpoint_silence > core.connect_buffer
-        {
-            return Err(Error::Config("invalid speech input limits".into()));
-        }
-        Ok(())
-    }
 }
 
 pub(crate) struct InputGate {

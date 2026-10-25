@@ -19,3 +19,23 @@ flowchart TD
     local -.->|"实现语音识别接口"| core
     adapters -->|"连接"| external
 ```
+
+# 数据流设计
+## 配置流图
+
+```mermaid
+flowchart TD
+    sqlite[("SQLite 配置")] --> load["Host 读取配置"]
+    toml["TOML 配置文件"] --> load
+
+    load --> feature["确定使用的功能"]
+    feature --> validate["Host 校验对应功能的配置"]
+    validate --> valid{"校验通过"}
+
+    valid -->|否| configError["Host 报告配置错误"]
+    valid -->|是| core["直接将参数传给 Core 执行"]
+
+    core --> result{"执行结果"}
+    result -->|成功| success["向 Host 返回结果"]
+    result -->|失败| error["向 Host 抛出错误"]
+```

@@ -16,13 +16,8 @@ pub async fn synthesize(
     max_text_bytes: usize,
     cancel: CancellationToken,
 ) -> Result<SynthesizedAudio> {
-    if !(8_000..=48_000).contains(&sample_rate)
-        || max_audio.is_zero()
-        || max_audio > Duration::from_secs(120)
-        || max_text_bytes == 0
-        || text.trim().is_empty()
-    {
-        return Err(Error::Config("invalid TTS input or limits".into()));
+    if text.trim().is_empty() {
+        return Err(Error::Protocol("TTS text must not be blank".into()));
     }
     if text.len() > max_text_bytes {
         return Err(Error::Busy("TTS text"));

@@ -135,31 +135,6 @@ impl SessionManager {
         agents: Vec<AgentBinding>,
         limits: SessionLimits,
     ) -> Result<Self> {
-        let mut ids = HashSet::new();
-        for agent in &agents {
-            if agent.id.trim().is_empty() || !ids.insert(&agent.id) || agent.workspaces.is_empty() {
-                return Err(Error::Config("invalid or duplicate agent binding".into()));
-            }
-            let mut workspaces = HashSet::new();
-            for workspace in &agent.workspaces {
-                if workspace.id.trim().is_empty()
-                    || !workspaces.insert(&workspace.id)
-                    || !workspace.path.is_absolute()
-                {
-                    return Err(Error::Config(
-                        "invalid or duplicate workspace option".into(),
-                    ));
-                }
-            }
-        }
-        if limits.max_acp_sessions == 0
-            || limits.max_acp_sessions > 64
-            || limits.max_runs == 0
-            || limits.max_runs > 1024
-            || limits.question_timeout.is_zero()
-        {
-            return Err(Error::Config("invalid execution limits".into()));
-        }
         let data = Memory::new(data)?;
         let (events, _) = broadcast::channel(128);
         Ok(Self(Arc::new(Inner {

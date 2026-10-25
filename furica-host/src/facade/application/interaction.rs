@@ -49,6 +49,13 @@ impl Host {
                 "text must contain 1–65536 bytes",
             ));
         }
+        if self.components.backend.is_none() {
+            return Err(Error::new(
+                503,
+                "model_unavailable",
+                "conversation model is not configured",
+            ));
+        }
         let mut state = self.state.lock().await;
         self.select_locked(&mut state, id, false).await?;
         let runtime = state.runtime.as_ref().ok_or_else(Error::conflict)?;

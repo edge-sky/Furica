@@ -310,12 +310,6 @@ async fn request_failures_happen_before_open() {
     let model = fake(text());
     let mut cases = Vec::new();
     let mut r = request();
-    r.max_output_tokens = 0;
-    cases.push(r);
-    let mut r = request();
-    r.reasoning = Some(Reasoning::BudgetTokens(0));
-    cases.push(r);
-    let mut r = request();
     r.tools.push(r.tools[0].clone());
     cases.push(r);
     let mut r = request();

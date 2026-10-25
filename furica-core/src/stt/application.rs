@@ -14,8 +14,8 @@ pub async fn transcribe(
     max_text_bytes: usize,
     cancel: CancellationToken,
 ) -> Result<String> {
-    if max_text_bytes == 0 || utterance.frames.is_empty() {
-        return Err(Error::Config("invalid STT input or text limit".into()));
+    if utterance.frames.is_empty() {
+        return Err(Error::Audio("empty STT input".into()));
     }
     let mut samples = 0usize;
     let mut previous = None;
@@ -46,12 +46,6 @@ pub(crate) fn validate_buffer(
     frames: usize,
     max_utterance: Duration,
 ) -> Result<()> {
-    if !(8_000..=48_000).contains(&sample_rate)
-        || max_utterance.is_zero()
-        || max_utterance > Duration::from_secs(120)
-    {
-        return Err(Error::Config("invalid STT audio limits".into()));
-    }
     let limit = max_utterance.as_nanos() * u128::from(sample_rate) / 1_000_000_000;
     if samples as u128 > limit || frames > 4096 {
         return Err(Error::Busy("STT utterance buffer"));

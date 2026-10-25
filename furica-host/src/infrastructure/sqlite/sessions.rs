@@ -122,6 +122,13 @@ impl SessionStore {
             questions: read_records(&tx, "questions", id)?,
         };
         data.validate().map_err(|_| Error::storage())?;
+        if data
+            .acp_sessions
+            .iter()
+            .any(|session| !session.workspace.is_absolute() || session.agent_id.is_empty())
+        {
+            return Err(Error::storage());
+        }
         Ok(data)
     }
     pub fn session_ids(&self) -> Result<Vec<Uuid>> {

@@ -5,8 +5,9 @@ use async_trait::async_trait;
 use std::pin::Pin;
 use tokio_util::sync::CancellationToken;
 
-/// Application input owned by the caller; the Core use case validates it,
-/// and the outbound adapter translates it to its wire protocol.
+/// Application input owned by the caller, which validates its configuration.
+/// Core checks message/protocol consistency and enforces runtime budgets; the
+/// outbound adapter translates the request to its wire protocol.
 #[derive(Clone, Debug)]
 pub struct ModelRequest {
     pub messages: Vec<ModelMessage>,

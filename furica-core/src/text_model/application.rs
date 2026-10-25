@@ -33,13 +33,6 @@ pub(crate) fn validate_request(
     max_messages: usize,
     limit: usize,
 ) -> Result<usize> {
-    if max_messages == 0
-        || limit == 0
-        || request.max_output_tokens == 0
-        || matches!(request.reasoning, Some(Reasoning::BudgetTokens(0)))
-    {
-        return Err(Error::Config("invalid text model request or limits".into()));
-    }
     if request.messages.len() >= max_messages {
         return Err(Error::Busy("pipeline conversation context"));
     }

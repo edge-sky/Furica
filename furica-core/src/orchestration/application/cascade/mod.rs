@@ -8,7 +8,7 @@ pub(super) use speech::SpeechQueue;
 mod worker;
 
 use crate::{
-    Error, Result,
+    Result,
     orchestration::{VoiceBackend, VoiceSession},
     stt::Stt,
     text_model::TextModel,
@@ -52,9 +52,9 @@ impl Default for CascadeConfig {
 #[derive(Clone)]
 pub struct CascadedBackend {
     config: CascadeConfig,
-    stt: Arc<dyn Stt>,
+    stt: Option<Arc<dyn Stt>>,
     model: Arc<dyn TextModel>,
-    tts: Arc<dyn Tts>,
+    tts: Option<Arc<dyn Tts>>,
 }
 
 impl CascadedBackend {
@@ -64,28 +64,23 @@ impl CascadedBackend {
         model: Arc<dyn TextModel>,
         tts: Arc<dyn Tts>,
     ) -> Result<Self> {
-        if !(8_000..=48_000).contains(&config.sample_rate)
-            || config.channel_capacity == 0
-            || config.channel_capacity > 4096
-            || config.max_utterance.is_zero()
-            || config.max_utterance > Duration::from_secs(120)
-            || config.max_generated_audio.is_zero()
-            || config.max_generated_audio > Duration::from_secs(120)
-            || config.inference_timeout.is_zero()
-            || config.max_history_messages == 0
-            || config.max_history_messages > 4096
-            || config.max_output_tokens == 0
-            || config.max_context_bytes == 0
-            || config.max_context_bytes > 4 * 1024 * 1024
-        {
-            return Err(Error::Config("invalid cascaded pipeline limits".into()));
-        }
-        Ok(Self {
+        Ok(Self::with_speech(config, Some(stt), model, Some(tts)))
+    }
+
+    /// Assemble only the supplied capabilities. Configuration is validated by the host.
+    /// A text-only conversation needs neither recognition nor synthesis.
+    pub fn with_speech(
+        config: CascadeConfig,
+        stt: Option<Arc<dyn Stt>>,
+        model: Arc<dyn TextModel>,
+        tts: Option<Arc<dyn Tts>>,
+    ) -> Self {
+        Self {
             config,
             stt,
             model,
             tts,
-        })
+        }
     }
 }
 
@@ -101,7 +96,7 @@ impl VoiceBackend for CascadedBackend {
         session_id: uuid::Uuid,
     ) -> Result<VoiceSession> {
         let history = sessions.main_history(session_id)?;
-        let tools = CoreTools::new(sessions.clone(), session_id, true);
+        let tools = CoreTools::new(sessions.clone(), session_id, self.tts.is_some());
         crate::text_model::validate_request(
             &crate::text_model::ModelRequest {
                 messages: history,

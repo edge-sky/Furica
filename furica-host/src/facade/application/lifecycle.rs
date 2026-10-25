@@ -36,9 +36,13 @@ impl Host {
     }
 
     pub(super) fn start_runtime(&self, state: &mut HostState, id: Uuid) -> Result<()> {
+        let Some(backend) = self.components.backend.clone() else {
+            state.selected = Some(id);
+            return Ok(());
+        };
         let (handle, mut output) = Core::start(
             self.config.core_config(),
-            self.components.backend.clone(),
+            backend,
             state.manager.clone(),
             id,
         )?;

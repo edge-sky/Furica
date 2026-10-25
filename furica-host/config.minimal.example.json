@@ -1,0 +1,6 @@
+{
+  "http": {
+    "token_env": "FURICA_HOST_TOKEN"
+  },
+  "workspace": "/absolute/path/to/workspace"
+}

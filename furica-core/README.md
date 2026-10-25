@@ -104,6 +104,17 @@ and no prompt is replayed. The host owns any old database-format conversion.
 `Core::start_gated(config, input, pipeline, sessions.clone(), session_id)` select an
 existing active business session. Configuration values are supplied when creating
 components; there is no configuration-file loading or live configuration mutation.
+The caller owns configuration validation, defaults and capability assembly. Core
+constructors do not validate configuration ranges, paths, bindings or component
+compatibility. Validate channel capacities and the selected pipeline's parameters
+before calling Core; runtime input, protocol and state errors are still returned.
+`CascadedBackend::with_speech(config, stt, model, tts)` accepts optional STT and TTS;
+text-only conversations need neither. No TTS means no `speak` tool, and an empty
+Agent list means no ACP tools. Recognition is required only when processing audio.
+The existing `CascadedBackend::new` remains a convenience for a full pipeline.
+Independent `stt`, `tts` and `text_model` calls require only their own adapters.
+Without a conversation backend, a host can use `SessionManager` for records without
+starting `Core::start`.
 A custom `VoiceBackend::connect(sessions, session_id)` receives the runtime manager
 and must record main messages through `append_message`, preserving roles, sources,
 continuations and tool results. `CascadedBackend` implements this contract, including

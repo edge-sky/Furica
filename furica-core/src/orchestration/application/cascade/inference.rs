@@ -2,7 +2,7 @@
 
 use super::CascadedBackend;
 use crate::{
-    Result,
+    Error, Result,
     stt::{self, Utterance},
     text_model::{self, FinishReason, ModelMessage, ModelRequest, ModelResponse},
 };
@@ -30,7 +30,11 @@ pub(super) async fn infer(
 ) -> Result<TurnResult> {
     let user_source = match &input {
         TurnInput::Audio(_) => Some(crate::sessions::MessageSource::UserVoice {
-            stt: backend.stt.source().map(str::to_owned),
+            stt: backend
+                .stt
+                .as_ref()
+                .and_then(|stt| stt.source())
+                .map(str::to_owned),
         }),
         TurnInput::Text(_) => Some(crate::sessions::MessageSource::UserText),
         TurnInput::Continue => None,
@@ -38,7 +42,10 @@ pub(super) async fn infer(
     let text = match input {
         TurnInput::Audio(utterance) => Some(
             stt::transcribe(
-                backend.stt.as_ref(),
+                backend
+                    .stt
+                    .as_deref()
+                    .ok_or_else(|| Error::State("STT is unavailable".into()))?,
                 utterance,
                 backend.config.max_utterance,
                 backend.config.max_context_bytes,

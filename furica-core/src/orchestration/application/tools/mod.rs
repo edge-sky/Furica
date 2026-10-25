@@ -24,7 +24,11 @@ pub(super) struct CoreTools {
 
 impl CoreTools {
     pub(super) fn new(sessions: SessionManager, session_id: Uuid, speech: bool) -> Self {
-        let mut entries = acp::entries();
+        let mut entries = if sessions.agents().is_empty() {
+            Vec::new()
+        } else {
+            acp::entries()
+        };
         let candidates: Vec<_> = sessions.agents().iter().map(|agent| json!({
             "agent_id": agent.id, "description": agent.description,
             "workspaces": agent.workspaces.iter().map(|w| json!({"workspace_id":w.id,"description":w.description})).collect::<Vec<_>>()

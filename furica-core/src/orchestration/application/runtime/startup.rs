@@ -31,7 +31,6 @@ impl Core {
         sessions: SessionManager,
         session_id: Uuid,
     ) -> Result<(CoreHandle, CoreOutput)> {
-        input.validate(&config)?;
         Self::build(
             config,
             pipeline.backend(),
@@ -58,17 +57,11 @@ impl Core {
         session_id: Uuid,
         input: Option<SpeechInput>,
     ) -> Result<(CoreHandle, CoreOutput)> {
-        config.validate()?;
         if sessions.session(session_id)?.state != crate::sessions::SessionState::Active {
             return Err(Error::State("session is archived".into()));
         }
         tokio::runtime::Handle::try_current()
             .map_err(|_| Error::State("Core::start requires a Tokio runtime".into()))?;
-        if backend.sample_rate() != config.sample_rate {
-            return Err(Error::Config(
-                "backend sample rate does not match core".into(),
-            ));
-        }
         let (commands, command_rx) = mpsc::channel(config.channel_capacity);
         let (audio, audio_rx) = mpsc::channel(config.channel_capacity);
         let (events, _) = broadcast::channel(config.channel_capacity);

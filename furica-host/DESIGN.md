@@ -30,11 +30,11 @@ HTTP 投影排除模型原始 continuation。PlaybackPosition、PlaybackChunk �
 
 | 部分/对象 | 字段及含义 |
 | --- | --- |
-| `HostConfig` | `http`、`workspace`（绝对路径）、`model`、`speech`（可空）、`acp`、`limits` |
+| `HostConfig` | `http`、`workspace`（绝对路径）、`model`（可空）、`speech`（可空）、`acp`（可空）、`limits` |
 | `HttpConfig` | `listen`（回环 IP 与端口）、`token_env`（非空环境变量名）、`allowed_origins`（完整 origin 列表，默认空） |
 | `ModelConfig` | `protocol`（`openai_compatible` / `openai_responses` / `anthropic`）、`endpoint`、`model`、`isolation_scope`、`api_key_env`、`connect_timeout_ms` |
 | 模型协议选项 | compatible：`max_tokens_field`、`supports_reasoning_effort`；responses：`supports_reasoning`；anthropic：`version`、`supports_adaptive_thinking`、`supports_thinking_budget`。按 protocol 定义带标签枚举，不接受不适用字段 |
-| `SpeechConfig` | `vad_model`（绝对 ONNX 文件路径）、`stt`、`tts`。整体为空时支持文字，语音开启返回能力不可用；不伪造 STT/TTS 结果 |
+| `SpeechConfig` | `vad_model`（可空的绝对 ONNX 文件路径）、`stt`（可空）、`tts`（可空）。连续语音输入使用 VAD、STT 与会话模型，TTS 独立可选 |
 | `SttConfig` | 带标签枚举：`sensevoice` 使用 `model_path`、`tokens_path`；`aliyun` 使用 `endpoint`、`model`、`api_key_env`；`volcengine` 使用前述云端字段及 `resource_id` |
 | `TtsConfig` | 带标签枚举：`aliyun` 使用 `endpoint`、`model`、`voice`、`api_key_env`；`volcengine` 再含 `resource_id`。输出采样率固定为本轮已确认的 16000，由 Host 传入现有配置并检查 |
 | `AcpConfig` | `command`（绝对可执行文件路径）、`agent_id`、`args`、`auth_method`（可空）、`handshake_timeout_ms`、`run_timeout_ms`、`cancel_timeout_ms`、`idle_timeout_ms`。映射到现有适配器 AcpConfig，不复制执行协议 |
@@ -184,3 +184,12 @@ SpeechStarted 触发 Core 现有打断时，组合适配器先等待并转发该
 退出先停止接入、关闭语音、清理 Core/ACP，再接收剩余消息，退出结果反映持久化和清理失败。
 Core 队列为内存队列，进程崩溃前尚未提交的数据不具备跨进程恢复保证。
 模型效果、云端账号和真实设备时延不由协议测试替代。完整边界见 [数据流](../docs/session-data-flow.md)。
+
+## 能力可选与配置校验边界
+
+ACP、STT、TTS 与会话文本模型均为可选能力，省略或 null 表示不装配。
+Host 校验已装配能力的配置和依赖，为 Core 提供运行参数；Core 不检查配置合法性，
+保留执行中的输入、协议、消息关联和状态错误处理。配置校验辅助函数位于
+`configuration/application/runtime.rs`。未启用能力的专用限制不阻止程序启动。
+没有会话模型时不读取系统提示词、不创建会话推理后端，仍支持会话记录管理。
+连续语音输入需要 VAD、STT 和会话模型；TTS 独立可选。

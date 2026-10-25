@@ -5,11 +5,17 @@
 
 ## 启动
 
-复制本目录 `config.example.json`，填写绝对工作目录、实际模型协议/端点/模型名和 ACP agent 可执行文件。
-示例中的 `.example` 域名和路径是占位值，不能直接用于真实调用。
-配置 `speech: null` 时文字交互可独立工作，开启语音返回 `voice_unavailable`。
-所选模型必须支持已有的工具调用契约；配置不隐式猜测供应商、账号或模型能力。
-先创建数据目录，并将本目录 `system-prompt.toml` 复制到 `<data-directory>/system-prompt.toml`。
+`model`、`acp`、`speech.stt`、`speech.tts` 和 `speech.vad_model` 均可省略或设为 `null`。
+不启用任何推理能力时，可使用 `config.minimal.example.json`，只配置 HTTP 与程序工作区；
+Host 仍提供健康检查、配置和会话记录管理，文字输入返回 `model_unavailable`，语音入口返回 `voice_unavailable`。
+配置检查集中在 Host，只检查已启用能力需要的参数；Core 接收上层准备好的运行参数并向外报告执行错误。
+
+需要文字对话时，填写 `config.example.json` 中的实际模型协议、端点、模型名与凭证环境变量；
+需要 ACP 时再填写 Agent 启动配置。示例中的 `.example` 域名和路径是占位值。
+STT 与 TTS 可分别配置：连续语音输入需要 VAD、STT 和会话模型，TTS 用于可选的 `speak` 输出。
+只有配置会话模型时才需要 `<data-directory>/system-prompt.toml` 和模型凭证；
+不配置模型时不会读取提示词文件。所选模型必须支持已有的工具调用契约。
+下面的命令演示启用会话模型的启动方式。
 
 ```sh
 mkdir -p /absolute/path/to/host-data
@@ -47,7 +53,7 @@ system = '''
 ```
 
 文件中的多行文本可直接手动编辑，示例还包含系统描述、功能调用策略与结果解释规则。
-文件在每次进程启动时读取，修改后重启生效；文件必须存在、使用 UTF-8、大小不超过 1 MiB。
+配置会话模型时，文件在每次进程启动时读取，修改后重启生效；此时文件必须存在、使用 UTF-8、大小不超过 1 MiB。
 格式错误、额外键、非字符串值、空白提示词、未知或未闭合变量会阻止启动。
 渲染后的文本仍受 `limits.max_context_bytes` 约束，模型请求还会统一计算历史和工具定义的预算。
 
@@ -110,7 +116,8 @@ curl -H "Authorization: Bearer $FURICA_HOST_TOKEN" -H 'Content-Type: application
 
 ## 持续语音
 
-`speech` 非空时指定 `vad_model`、`stt`、`tts`。路径必须为绝对路径。
+`speech` 中的 `vad_model`、`stt`、`tts` 分别可选。连续语音输入启用时需要 `vad_model` 和 `stt`，
+`tts` 可以省略，此时仅显示文字回复。已配置的本地模型路径必须为绝对路径。
 VAD 使用现有 Silero 默认触发策略，输入/输出均固定单声道 16 kHz PCM16 小端。
 不接声纹门控；所有者主动开启。此选择已经在实施契约中确认。
 

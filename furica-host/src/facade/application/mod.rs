@@ -32,7 +32,7 @@ use uuid::Uuid;
 use voice_lease::VoiceLease;
 
 pub struct Components {
-    pub backend: Arc<dyn VoiceBackend>,
+    pub backend: Option<Arc<dyn VoiceBackend>>,
     pub agents: Vec<AgentBinding>,
     pub speech_enabled: Arc<AtomicBool>,
     pub voice_available: bool,
@@ -80,6 +80,20 @@ impl Host {
         database_path: PathBuf,
     ) -> Result<Arc<Self>> {
         config.validate()?;
+        crate::configuration::application::runtime::validate_agents(
+            &components.agents,
+            &config.session_limits(),
+        )?;
+        if components.voice_available && components.backend.is_none() {
+            return Err(Error::config());
+        }
+        if let Some(backend) = &components.backend {
+            crate::configuration::application::runtime::validate_core(&config.core_config())?;
+            if backend.sample_rate() != config.core_config().sample_rate {
+                return Err(Error::config());
+            }
+        }
+
         let store = Arc::new(SessionStore::new(
             database_path,
             config.limits.context_max_bytes,
@@ -224,6 +238,7 @@ impl Host {
             "storage":if self.storage_healthy.load(Ordering::Acquire) {"healthy"} else {"failed"},
             "interaction_state":state.runtime.as_ref().map(|r| format!("{:?}",r.handle.state())).unwrap_or("Standby".into()),
             "active_session_id":state.selected,"voice_available":self.components.voice_available,
+            "text_available":self.components.backend.is_some(), "acp_available":!self.components.agents.is_empty(),
             "voice_channel_id":state.voice.as_ref().map(|v| v.id),"playback_generation":playback.generation,"playback_active":playback.active,
             "sample_rate":16000,"channels":1,"encoding":"pcm_s16le","max_batch_samples":3200,
             "heartbeat_interval_ms":5000,"heartbeat_timeout_ms":self.config.limits.heartbeat_timeout_ms,

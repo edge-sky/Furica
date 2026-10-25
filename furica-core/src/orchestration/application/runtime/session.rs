@@ -23,9 +23,6 @@ pub struct VoiceChannels {
 
 impl VoiceSession {
     pub fn channels(capacity: usize) -> Result<(Self, VoiceChannels)> {
-        if capacity == 0 || capacity > 4096 {
-            return Err(Error::Config("invalid voice channel capacity".into()));
-        }
         let (command_tx, command_rx) = mpsc::channel(capacity);
         let (event_tx, event_rx) = mpsc::channel(capacity);
         let cancel = CancellationToken::new();

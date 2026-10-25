@@ -48,10 +48,8 @@ impl SessionData {
             }
         }
         for s in &self.acp_sessions {
-            if !belongs(s.session_id) || !s.workspace.is_absolute() || s.agent_id.is_empty() {
-                return Err(Error::Config(
-                    "invalid ACP session ownership or configuration".into(),
-                ));
+            if !belongs(s.session_id) {
+                return Err(Error::State("invalid ACP session ownership".into()));
             }
         }
         let mut sequences = HashSet::new();
