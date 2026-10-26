@@ -25,8 +25,8 @@ async fn run() -> furica_host::Result<()> {
     if args.next().is_some() {
         return Err(furica_host::Error::config());
     }
-    let (host, store, token) = bootstrap::start(PathBuf::from(directory), initial).await?;
-    let listener = match tokio::net::TcpListener::bind(host.config.http.listen).await {
+    let (host, _store, token) = bootstrap::start(PathBuf::from(directory), initial).await?;
+    let listener = match tokio::net::TcpListener::bind(host.config().http.listen).await {
         Ok(listener) => listener,
         Err(_) => {
             let _ = host.shutdown().await;
@@ -43,7 +43,7 @@ async fn run() -> furica_host::Result<()> {
             .local_addr()
             .map_err(|_| furica_host::Error::config())?
     );
-    let result = http::serve(listener, host.clone(), store, token, async {
+    let result = http::serve(listener, host.clone(), token, async {
         #[cfg(unix)]
         {
             if let Ok(mut terminate) =

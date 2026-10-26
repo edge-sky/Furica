@@ -15,10 +15,11 @@ use uuid::Uuid;
 impl Host {
     fn authorize_voice(&self, lease: &VoiceLease, id: Uuid, token: &str) -> Result<()> {
         lease.authorize(id, token)?;
+        let components = self.components.current();
         if lease.last_seen.elapsed()
-            >= Duration::from_millis(self.config.limits.heartbeat_timeout_ms)
+            >= Duration::from_millis(components.config.limits.heartbeat_timeout_ms)
             || lease.retry_expired(Duration::from_millis(
-                self.config.limits.upload_retry_window_ms,
+                components.config.limits.upload_retry_window_ms,
             ))
         {
             lease.cancelled.cancel();
@@ -27,6 +28,7 @@ impl Host {
         Ok(())
     }
     pub async fn open_voice(&self, session_id: Uuid, owner: String) -> Result<Value> {
+        self.accepting()?;
         if owner.trim().is_empty() || owner.len() > 128 {
             return Err(Error::new(
                 400,
@@ -43,7 +45,8 @@ impl Host {
                 "another voice channel is active",
             ));
         }
-        if !self.components.voice_available {
+        let components = self.components.current();
+        if !components.voice_available {
             return Err(Error::new(
                 503,
                 "voice_unavailable",
@@ -53,12 +56,10 @@ impl Host {
         self.select_locked(&mut state, session_id, false).await?;
         let runtime = state.runtime.as_ref().ok_or_else(Error::conflict)?;
         self.reset_backend(runtime).await?;
-        self.components
-            .speech_enabled
-            .store(true, Ordering::Release);
-        let (tx, rx) = mpsc::channel(self.config.limits.channel_capacity);
+        components.speech_enabled.store(true, Ordering::Release);
+        let (tx, rx) = mpsc::channel(components.config.limits.channel_capacity);
         let lease = VoiceLease::new(session_id, owner, rx);
-        let response = json!({"channel_id":lease.id,"voice_token":lease.token,"session_id":lease.session_id,"sample_rate":16000,"channels":1,"encoding":"pcm_s16le","next_sequence":0,"heartbeat_interval_ms":5000,"heartbeat_timeout_ms":self.config.limits.heartbeat_timeout_ms});
+        let response = json!({"channel_id":lease.id,"voice_token":lease.token,"session_id":lease.session_id,"sample_rate":16000,"channels":1,"encoding":"pcm_s16le","next_sequence":0,"heartbeat_interval_ms":5000,"heartbeat_timeout_ms":components.config.limits.heartbeat_timeout_ms});
         *self.delivery.lock().map_err(|_| Error::conflict())? =
             Some((lease.id, tx, lease.cancelled.clone()));
         state.voice = Some(lease);
@@ -83,12 +84,11 @@ impl Host {
             return Ok(());
         };
         lease.cancelled.cancel();
+        let components = self.components.current();
         if let Ok(mut delivery) = self.delivery.lock() {
             *delivery = None;
         }
-        self.components
-            .speech_enabled
-            .store(false, Ordering::Release);
+        components.speech_enabled.store(false, Ordering::Release);
         let result = match state.runtime.as_ref() {
             Some(runtime) => self.reset_backend(runtime).await,
             None => Ok(()),
@@ -97,11 +97,13 @@ impl Host {
         result
     }
     pub async fn close_voice(&self, id: Uuid, token: &str) -> Result<()> {
+        self.accepting()?;
         let mut state = self.state.lock().await;
         self.authorize_voice(state.voice.as_ref().ok_or_else(gone)?, id, token)?;
         self.close_voice_locked(&mut state, "closed").await
     }
     pub async fn heartbeat(&self, id: Uuid, token: &str) -> Result<()> {
+        self.accepting()?;
         let mut state = self.state.lock().await;
         let lease = state.voice.as_mut().ok_or_else(gone)?;
         self.authorize_voice(lease, id, token)?;
@@ -115,6 +117,7 @@ impl Host {
         sequence: u64,
         pcm: Vec<u8>,
     ) -> Result<Value> {
+        self.accepting()?;
         let mut state = self.state.lock().await;
         self.usable(&state)?;
         let lease = state.voice.as_ref().ok_or_else(gone)?;
@@ -148,6 +151,7 @@ impl Host {
                 .map(|s| i16::from_le_bytes([s[0], s[1]]))
                 .collect(),
         };
+        let components = self.components.current();
         match runtime.handle.audio(frame) {
             Ok(()) => {
                 state.capture_sequence += 1;
@@ -161,8 +165,8 @@ impl Host {
                 let exhausted = state.voice.as_mut().expect("authorized").backpressure(
                     sequence,
                     &pcm,
-                    self.config.limits.upload_retry_limit,
-                    Duration::from_millis(self.config.limits.upload_retry_window_ms),
+                    components.config.limits.upload_retry_limit,
+                    Duration::from_millis(components.config.limits.upload_retry_window_ms),
                 );
                 if exhausted {
                     self.close_voice_locked(&mut state, "upload_retry_exhausted")
@@ -191,6 +195,7 @@ impl Host {
         watch::Receiver<PlaybackState>,
         CancellationToken,
     )> {
+        self.accepting()?;
         let mut state = self.state.lock().await;
         let playback = state.runtime.as_ref().ok_or_else(gone)?.playback.clone();
         let lease = state.voice.as_mut().ok_or_else(gone)?;
@@ -211,6 +216,7 @@ impl Host {
         generation: u64,
         position: PlaybackPosition,
     ) -> Result<()> {
+        self.accepting()?;
         let state = self.state.lock().await;
         self.authorize_voice(state.voice.as_ref().ok_or_else(gone)?, id, token)?;
         state

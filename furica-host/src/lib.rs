@@ -4,6 +4,7 @@ pub mod configuration;
 pub mod facade;
 pub mod infrastructure;
 
-pub use facade::application::{Components, Host};
+pub use facade::application::Host;
+pub use infrastructure::components::Components;
 
 pub use facade::error::{Error, Result};

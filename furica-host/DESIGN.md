@@ -13,7 +13,8 @@ Core 保留业务规则与工具执行，Host 组织持久化，不增加第二�
 - configuration：配置定义、校验及 Core/适配器配置转换。
 - infrastructure/sqlite：共用数据库连接策略与版本迁移，分别实现配置及会话记录读写。
 - infrastructure/audio、model_policy：保留必要的 VAD 和模型调用策略适配。
-- bootstrap：组件装配、目录独占锁、启动加载。
+- infrastructure/components：基于配置构建、持有和替换整套能力实例；管理器不依赖 Host。
+- bootstrap：调用统一构建入口，负责目录独占锁与启动加载。
 
 复用现有 Host、HostState、Runtime 和 SessionStore。HostState/Runtime 及其字段限制在 facade 应用层内；
 bootstrap 通过方法移交目录锁。切换会话与归档当前会话共用清理和重建流程，保留原来的串行边界。
@@ -56,13 +57,17 @@ SQLite 使用 `PRAGMA user_version=4`，只支持新建空库或打开版本 4�
 配置读取不写回默认值；配置保存使用独立事务，避免协议切换遗留字段。
 连接使用 synchronous=FULL 和有界 busy timeout。目录锁保存在独立锁库。
 
-配置更新先验证结构和静态边界，再提交；报告 `restart_required=true`，不热应用。
+PUT 配置时先校验并构建候选实例，再关闭业务接入、中断旧推理/语音/ACP 并落库，保存配置后发布整组新实例。
+成功返回 `saved=true, applied=true, restart_required=false`。显式 reload 从 SQLite 重读配置，复用相同流程但不重写配置表。
+切换后解除会话选择，不重放已中断工作；客户端重新选择会话或建立语音通道。
+构建失败不干扰旧任务；中断后清理或保存失败时保持未就绪，排除故障后可重试更新。
+监听地址、访问令牌引用、CORS 名单、工作区、公共通道容量及存储导入上限变化返回 409/restart_required，整次 PUT 不保存。
 配置中仅保存凭证环境变量名；访问令牌与供应商密钥不写数据库、事件或日志。
 
 系统提示词以数据目录中的 `system-prompt.toml` 为唯一来源，使用单个 `system` 字符串 K-V。
 文件只包含提示词工程文本；语言、时区和工作目录的变量值与一次替换集中在
 `configuration/application/prompts.rs::render_system`，文件读取及 TOML 解析位于 `infrastructure/prompts.rs`。
-bootstrap 在启动时读取并渲染，再将结果传给现有 CascadeConfig.instructions；编辑后重启生效。
+infrastructure/components 在启动和每次 PUT/reload 时重新读取并渲染，再传给现有 CascadeConfig.instructions；同配置 reload 也重新读取文件。
 移除 HostConfig.instructions；现有版本 4 数据库读取时忽略遗留的 instructions 项，保存完整配置时清理。
 配置 API 和初始化 JSON 不再接受旧字段，不修改会话记录或 core 的系统消息记录机制。
 
@@ -76,8 +81,9 @@ bootstrap 在启动时读取并渲染，再将结果传给现有 CascadeConfig.i
 | 对象 | 字段/结构 |
 | --- | --- |
 | `ApiError` | `code`（稳定错误码）、`message`（安全错误说明）、`retryable`（布尔）；不透传凭证或供应商原始响应 |
-| `HealthView` | `ready`、`storage`（`healthy` / `failed`）、`interaction_state`、`active_session_id`（可空）、`voice_available`、`voice_channel_id`（可空）、`playback_generation`、`playback_active`、`sample_rate=16000`、`channels=1`、`encoding=pcm_s16le`、`max_batch_samples=3200`、`heartbeat_interval_ms=5000`、`heartbeat_timeout_ms`、`upload_retry_limit`、`upload_retry_window_ms` |
-| `SaveConfigResult` | `saved=true`、`restart_required=true` |
+| `HealthView` | `updating`、`ready`、`storage`（`healthy` / `failed`）、`interaction_state`、`active_session_id`（可空）、`voice_available`、`voice_channel_id`（可空）、`playback_generation`、`playback_active`、`sample_rate=16000`、`channels=1`、`encoding=pcm_s16le`、`max_batch_samples=3200`、`heartbeat_interval_ms=5000`、`heartbeat_timeout_ms`、`upload_retry_limit`、`upload_retry_window_ms` |
+| `SaveConfigResult` | `saved=true`、`applied=true`、`restart_required=false` |
+| `ReloadConfigResult` | `applied=true`、`restart_required=false` |
 | `SessionView` | 复用 Core Session 的 `id`、`name`、`state`、`created_at_ms`、`updated_at_ms` |
 | `RenameSession` | `name` |
 | `SelectSession` | `session_id` |
@@ -90,7 +96,7 @@ bootstrap 在启动时读取并渲染，再将结果传给现有 CascadeConfig.i
 | `VoiceLeaseView` | `channel_id`（每次开启新 UUID）、`voice_token`（仅开启成功响应返回）、`session_id`、`sample_rate`、`channels`、`encoding`、`next_sequence=0`、`heartbeat_interval_ms`、`heartbeat_timeout_ms` |
 | `UploadReceipt` | `sequence`、`next_sequence`、`duplicate`。批次号使用路径中的 u64，正文为二进制 PCM，Content-Type 为 application/octet-stream |
 | `PlaybackReport` | `generation`、`item_id`、`content_index`、`played_ms`，映射为 Core PlaybackPosition；仅真实播放后上报 |
-| `HostEvent` | 带 `kind` 标签，包含以下变体所需字段：`state`（session_id/state）、`transcript`（session_id/user/text/final_chunk）、`sessions_changed`（无快照）、`playback`（channel_id/generation/active）、`voice_closed`（channel_id/reason）、`storage`（healthy 布尔）、`error`（code/message）、`resync`（要求重新查询） |
+| `HostEvent` | 带 `kind` 标签，包含以下变体所需字段：`state`（session_id/state）、`transcript`（session_id/user/text/final_chunk）、`sessions_changed`（无快照）、`playback`（channel_id/generation/active）、`voice_closed`（channel_id/reason）、`storage`（healthy 布尔）、`error`（code/message）、`configuration_changed`（applied 布尔，不含配置内容）、`resync`（要求重新查询） |
 
 HTTP 错误基本映射：400 参数/格式错误；401 凭证错误；403 Origin/Host 拒绝；404 业务资源不存在；
 409 占用、模式/会话冲突、重复内容冲突、断序；410 已失效通道；413 超出大小；429 有界队列背压；
@@ -101,7 +107,10 @@ HTTP 错误基本映射：400 参数/格式错误；401 凭证错误；403 Origi
 | 路由 | 用途 |
 | --- | --- |
 | `GET /health` | 健康/就绪/能力和播放恢复查询 |
-| `GET/PUT /configuration` | 查询/事务保存配置，不热更新 |
+| `GET /configuration` | 查询数据库保存的配置 |
+| `GET /configuration/active` | 查询最近一次成功发布的配置 |
+| `PUT /configuration` | 保存并重新实例化；允许中断旧任务 |
+| `POST /configuration/reload` | 重新读取数据库和提示词并重新实例化 |
 | `POST/GET /sessions` | 创建/分页列表 |
 | `GET/PATCH /sessions/{id}` | 状态查询/改名 |
 | `POST /sessions/{id}/archive` | 归档；当前会话存在语音或非终态任务时拒绝 |
@@ -134,7 +143,9 @@ header 为 `AudioEnvelope { channel_id, generation, item_id, content_index, samp
 | --- | --- |
 | 配置存储 | SQLite 路径/连接；只负责迁移及配置事务，不依赖 HTTP handler |
 | 会话存储与消息接收 | SQLite 路径、单会话导入上限、待交付通知、串行接收锁和存储健康状态。完整记录及接收凭据同事务提交后确认序号 |
-| Host 运行协调 | 当前 SessionManager、已选 Session UUID、可空 CoreHandle/CoreOutput、运行 epoch、组件工厂、停止信号。切换及启停互斥，业务会话和 HTTP 连接不共享生命周期 |
+| Host 运行协调 | 当前 SessionManager、已选 Session UUID、可空 CoreHandle/CoreOutput、组件管理器、配置存储、更新标记和停止信号。切换及启停互斥，业务会话和 HTTP 连接不共享生命周期 |
+| Components | 对应 HostConfig、已渲染提示词、基础模型/STT/TTS、会话 backend、ACP 绑定、语音控制与取消令牌；对外只读访问 |
+| ComponentManager | 当前整组资源引用和串行更新锁；资源构建与发布，业务中断仍由 Host 编排 |
 | 文字策略适配器 | 原 TextModel 引用、共享的文字/语音模式标记；单次调用锁定模式，文字模式删除请求 tools 中的 speak，拒绝供应商流中任何不在本次允许集的 ToolStart；保持原 continuation_source，不修改历史、原始续接或工具结果 |
 | 语音通道协调 | `Closed` / `Opening` / `Open` / `Closing`；通道 UUID、随机 owner token、业务会话 UUID、owner、最后心跳、期望批次号、上一已接受批次原始字节、当前失败批次及重试次数/起点、单消费者下载占用、取消令牌。整个 Host 只保留一份占用 |
 | 上行去重 | 仅保存上一已接受批次的完整字节及序号；相同序号/字节返回 duplicate，内容不同拒绝；其他旧序号和未来序号拒绝。队列满不推进序号；同批次的背压重试计数有界，耗尽关闭通道 |
@@ -193,3 +204,12 @@ Host 校验已装配能力的配置和依赖，为 Core 提供运行参数；Cor
 `configuration/application/runtime.rs`。未启用能力的专用限制不阻止程序启动。
 没有会话模型时不读取系统提示词、不创建会话推理后端，仍支持会话记录管理。
 连续语音输入需要 VAD、STT 和会话模型；TTS 独立可选。
+
+
+## 配置热更新补充契约（2026-10-26）
+
+切换前的业务操作与更新发布共用 Host 状态边界；新的业务操作在 updating 时返回 503。
+更新期间健康查询可直接返回 `{"ready":false,"updating":true}`，不等待旧任务清理。
+HTTP 调用方断开不取消 Host 持有的更新工作。并发 PUT/reload 串行读取、构建、清理和发布。
+启动参数具体列表及错误恢复策略见 [实例管理与热更新方案](../docs/configured-components-proposal.md)。
+切换会话本身仍遵循第 6 节的忙时拒绝规则，配置更新采用用户明确授权的主动中断规则。

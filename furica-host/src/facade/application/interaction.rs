@@ -24,10 +24,11 @@ impl Host {
         }
         self.stop_receiver(state).await;
         let data = self.database(move |store| store.context(id)).await?;
+        let components = self.components.current();
         state.manager = SessionManager::with_agents(
             data,
-            self.components.agents.clone(),
-            self.config.session_limits(),
+            components.agents.clone(),
+            components.config.session_limits(),
         )?;
         self.receive_messages(&state.manager).await?;
         self.start_receiver(state);
@@ -38,10 +39,12 @@ impl Host {
         started
     }
     pub async fn select(&self, id: Uuid) -> Result<()> {
+        self.accepting()?;
         let mut state = self.state.lock().await;
         self.select_locked(&mut state, id, true).await
     }
     pub async fn text(&self, id: Uuid, text: String) -> Result<()> {
+        self.accepting()?;
         if text.trim().is_empty() || text.len() > 64 * 1024 {
             return Err(Error::new(
                 400,
@@ -49,20 +52,22 @@ impl Host {
                 "text must contain 1–65536 bytes",
             ));
         }
-        if self.components.backend.is_none() {
+        let mut state = self.state.lock().await;
+        self.usable(&state)?;
+        if self.components.current().backend.is_none() {
             return Err(Error::new(
                 503,
                 "model_unavailable",
                 "conversation model is not configured",
             ));
         }
-        let mut state = self.state.lock().await;
         self.select_locked(&mut state, id, false).await?;
         let runtime = state.runtime.as_ref().ok_or_else(Error::conflict)?;
         self.active(runtime).await?;
         runtime.handle.text(text).await.map_err(Into::into)
     }
     pub async fn interrupt(&self) -> Result<()> {
+        self.accepting()?;
         let state = self.state.lock().await;
         self.usable(&state)?;
         state

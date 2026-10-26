@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 impl Host {
     pub async fn create_session(&self) -> Result<Session> {
+        self.accepting()?;
         let state = self.state.lock().await;
         self.usable(&state)?;
         let session = self.database(|store| store.create_session()).await?;
@@ -12,6 +13,7 @@ impl Host {
         Ok(session)
     }
     pub async fn rename_session(&self, id: Uuid, name: String) -> Result<Session> {
+        self.accepting()?;
         let state = self.state.lock().await;
         self.usable(&state)?;
         if state.selected == Some(id) {
@@ -28,6 +30,7 @@ impl Host {
         Ok(session)
     }
     pub async fn archive(&self, id: Uuid) -> Result<Session> {
+        self.accepting()?;
         let mut state = self.state.lock().await;
         self.usable(&state)?;
         if state.selected == Some(id) {
@@ -46,13 +49,14 @@ impl Host {
     async fn context_manager(&self, id: Uuid) -> Result<SessionManager> {
         let session = self.database(move |store| store.session(id)).await?;
         // Metadata commands need only the owner; historical records remain in the database.
+        let components = self.components.current();
         Ok(SessionManager::with_agents(
             SessionData {
                 sessions: vec![session],
                 ..Default::default()
             },
-            self.components.agents.clone(),
-            self.config.session_limits(),
+            components.agents.clone(),
+            components.config.session_limits(),
         )?)
     }
     pub async fn session_status(&self, id: Uuid) -> Result<Value> {

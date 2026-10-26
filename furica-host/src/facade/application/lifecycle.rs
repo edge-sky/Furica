@@ -25,10 +25,11 @@ impl Host {
         let stream = state.manager.delivery_id();
         self.database(move |store| store.finish_delivery(stream))
             .await?;
+        let components = self.components.current();
         state.manager = SessionManager::with_agents(
             SessionData::default(),
-            self.components.agents.clone(),
-            self.config.session_limits(),
+            components.agents.clone(),
+            components.config.session_limits(),
         )?;
         state.selected = None;
         state.capture_sequence = 0;
@@ -36,12 +37,13 @@ impl Host {
     }
 
     pub(super) fn start_runtime(&self, state: &mut HostState, id: Uuid) -> Result<()> {
-        let Some(backend) = self.components.backend.clone() else {
+        let components = self.components.current();
+        let Some(backend) = components.backend.clone() else {
             state.selected = Some(id);
             return Ok(());
         };
         let (handle, mut output) = Core::start(
-            self.config.core_config(),
+            components.config.core_config(),
             backend,
             state.manager.clone(),
             id,
@@ -149,7 +151,7 @@ impl Host {
             }
         };
         tokio::time::timeout(
-            Duration::from_millis(self.config.limits.connect_timeout_ms + 500),
+            Duration::from_millis(self.config().limits.connect_timeout_ms + 500),
             activate,
         )
         .await
@@ -181,6 +183,7 @@ impl Host {
         Ok(())
     }
     pub async fn shutdown(&self) -> Result<()> {
+        let _update = self.components.update_lock.lock().await;
         if self.stopped.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -197,11 +200,7 @@ impl Host {
         } else {
             Ok(())
         };
-        let mut executors = Ok(());
-        for agent in &self.components.agents {
-            let result = agent.executor.shutdown().await.map_err(Into::into);
-            executors = executors.and(result);
-        }
+        let executors = self.components.current().shutdown().await;
         self.stop_receiver(&mut state).await;
         let saved = self.receive_messages(&state.manager).await;
         voice.and(runtime).and(manager).and(executors).and(saved)?;

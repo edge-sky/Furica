@@ -32,13 +32,29 @@ Host 为数据目录设置 Unix 0700 权限。
 进程通过 `.host.lock.sqlite3` 的排他锁独占数据目录，第二个进程在访问数据库前被拒绝，进程退出自动释放。
 Ctrl-C / SIGTERM 会停止接入、释放语音、等待 Core/ACP 清理并接收并提交剩余消息；失败以非零状态退出。
 
-`GET/PUT /configuration` 查询/事务保存下次启动配置，返回 `saved` 和 `restart_required`。
+`GET /configuration` 查询 SQLite 中保存的配置；`GET /configuration/active` 查询最近一次成功发布的配置。
+`PUT /configuration` 先校验并构建候选实例，再中断旧推理、语音和 ACP 任务、保存最终状态，
+事务保存配置并切换整套实例。成功返回 `{"saved":true,"applied":true,"restart_required":false}`。
+`POST /configuration/reload` 从 SQLite 重新读取配置并走相同应用流程，不改写配置表；成功返回
+`{"applied":true,"restart_required":false}`。修改 SQL 或提示词文件后需显式调用，不自动监听文件或数据库。
+
+切换期间拒绝新的业务操作，`GET /health` 返回 `ready:false, updating:true`。
+切换完成后解除当前会话选择；业务记录保留，已中断任务不自动恢复或重放，语音通道需要重新打开。
+配置、提示词、凭证或实例构建失败不影响旧任务。停止旧任务后发生清理或持久化失败时，
+Host 保持未就绪，不发布候选实例；排除故障后再次 PUT 或 reload 可重建运行状态。
+更新由 Host 持有的工作任务完成，HTTP 调用方断开不会放弃已经开始的切换。
 配置表 `host_configuration(key, value)` 按字段存储：key 使用点分路径（如 `model.endpoint`），
 value 使用 JSON 编码，数组作为一个值保存。读取缺失字段时使用代码中已有的默认值，
 读取操作不将默认值写回数据库；非法值或缺失必要字段仍报配置错误。
 整份配置保存采用事务替换，因此切换协议不会遗留旧协议字段。
 数据库版本为 4，只支持新建空数据库或打开版本 4；旧版本直接拒绝，不提供迁移或旧 JSON 导入。
-修改数据库不热更新当前组件、凭证、监听地址或 CORS 名单。
+直接修改数据库只改变保存配置，不会立即更新运行实例；显式 reload 才应用。
+模型、STT/TTS、ACP、提示词以及相关运行限制支持整体重建。
+以下启动参数变化返回 HTTP 409、`restart_required` 错误码和具体字段说明，并拒绝整次 PUT（不保存、也不部分应用）：
+`http.listen`、`http.token_env`、`http.allowed_origins`、`workspace`、`limits.channel_capacity`、`limits.context_max_bytes`。
+显式 reload 遇到这些变化也会拒绝应用，但不撤销外部已经写入的 SQL。
+凭证重新读取当前进程的环境变量，无法取得其他进程后来设置的环境变量。
+更换模型后，已有会话的供应商 continuation 仍须通过既有来源校验；不兼容时请创建新会话，不自动迁移历史。
 启动时校验配置、加载选中能力和本地文件；云端连接/账号是否有效仍需真实调用验证。
 
 ## 系统提示词
@@ -53,7 +69,7 @@ system = '''
 ```
 
 文件中的多行文本可直接手动编辑，示例还包含系统描述、功能调用策略与结果解释规则。
-配置会话模型时，文件在每次进程启动时读取，修改后重启生效；此时文件必须存在、使用 UTF-8、大小不超过 1 MiB。
+配置会话模型时，文件在启动和每次 PUT/reload 时读取，即使配置相同也重新读取；文件必须存在、使用 UTF-8、大小不超过 1 MiB。
 格式错误、额外键、非字符串值、空白提示词、未知或未闭合变量会阻止启动。
 渲染后的文本仍受 `limits.max_context_bytes` 约束，模型请求还会统一计算历史和工具定义的预算。
 
@@ -92,7 +108,10 @@ curl -H "Authorization: Bearer $FURICA_HOST_TOKEN" -H 'Content-Type: application
 | 路由 | 行为 |
 | --- | --- |
 | `GET /health` | 就绪、存储、交互状态、播放版本、语音能力和限制 |
-| `GET/PUT /configuration` | 配置查询与保存；需重启生效 |
+| `GET /configuration` | 查询数据库中保存的配置 |
+| `GET /configuration/active` | 查询最近一次成功发布的配置 |
+| `PUT /configuration` | 保存配置并重新实例化，允许中断旧任务 |
+| `POST /configuration/reload` | 重读数据库和提示词，重新实例化 |
 | `POST/GET /sessions` | 创建/分页列表 |
 | `GET/PATCH /sessions/{id}` | 状态/改名 `{ "name": "…" }` |
 | `POST /sessions/{id}/archive` | 归档；当前语音或任务占用时拒绝 |
@@ -176,7 +195,7 @@ Host 启动时逐会话加载并归一化历史；未完成执行中断、问题
 可靠交付覆盖当前进程内的有序接收、失败重试和事务去重。Core 未交付队列保存在内存，
 进程异常退出前尚未提交的输出不能恢复；已提交记录恢复时不会自动重放 ACP 副作用。
 音频沿用 `PlaybackChunk` 和实际播放反馈，不新增音频存档或断点续传。
-不支持多个业务会话同时运行、运行配置热更新、可靠 SSE 日志或设备控制。
+不支持多个业务会话同时运行、可靠 SSE 日志或设备控制。
 SSE 滞后/重连后查询最新状态。
 
 ## 代码职责
@@ -184,7 +203,10 @@ SSE 滞后/重连后查询最新状态。
 `facade/http` 负责 HTTP、鉴权、响应投影与音频编码；`facade/application` 负责 Shell 用例及 Core 生命周期协调。
 共享运行状态只在 facade 应用层内部访问，切换与归档复用清理和重建流程。
 `infrastructure/sqlite` 统一负责配置及会话记录读写；`infrastructure/audio` 和 `model_policy` 保留必要的能力适配。
-`configuration` 定义并校验配置，`bootstrap` 负责组装、数据目录锁及启动恢复。
+`configuration` 定义并校验配置；`infrastructure/components` 持有配置及对应实例，统一构建与替换。
+`bootstrap` 调用该构建入口，负责数据目录锁及启动恢复；`facade/application/configuration` 协调任务中断和配置应用。
+嵌入式调用改用 `Host::new(components, database_path)`；注入自有 backend 时使用 `Components::new(...)`。
+配置读取改为 `host.config()`；HTTP 启动使用 `http::serve(listener, host, token, shutdown)`，配置存储由 Host 自行持有。
 不再单独建立 Host 的 interaction、sessions、voice 领域包装模块；公开 HTTP 路径保持兼容。
 
 ## 验证
@@ -194,6 +216,11 @@ cargo test -p furica-host --offline
 cargo clippy -p furica-host --all-targets --offline -- -D warnings
 cargo test -p furica-host --offline --test vad real_silero -- --ignored
 ```
+
+本次热更新回归使用 `--lib` 和 `bootstrap`、`capabilities`、`hot_reload`、`http`、`interaction`、
+`storage`、`vad`、`voice` 测试目标，共 43 项通过、1 项真实模型测试忽略；对应目标 Clippy 通过。
+当前工作区的 `credentials` 测试依赖尚未接入的明文凭证接口（如 `save_update`、`http.token`），
+其编译错误在本轮开始前已经存在，因此上述全量 test/all-targets 命令仍不能通过。
 
 HTTP 测试需要本机回环监听权限，并明确绕开环境代理。
 测试替身覆盖协议、任务保存确认、故障和资源生命周期；微型 ONNX 夹具只验证输入适配。

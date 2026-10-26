@@ -3,10 +3,7 @@ mod projection;
 mod sessions;
 mod voice;
 
-use crate::{
-    Error, Host, Result, configuration::application::HostConfig, facade::constant_eq,
-    infrastructure::sqlite::ConfigStore,
-};
+use crate::{Error, Host, Result, configuration::application::HostConfig, facade::constant_eq};
 use bytes::Bytes;
 use furica_core::playback::{PlaybackChunk, PlaybackState};
 use futures_util::stream;
@@ -36,7 +33,6 @@ type HttpResponse = Response<Body>;
 
 struct Access {
     host: Arc<Host>,
-    store: ConfigStore,
     token: String,
     address: SocketAddr,
     stop: CancellationToken,
@@ -47,7 +43,6 @@ struct Access {
 pub async fn serve(
     listener: TcpListener,
     host: Arc<Host>,
-    store: ConfigStore,
     token: String,
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<()> {
@@ -56,9 +51,10 @@ pub async fn serve(
         return Err(Error::config());
     }
     let access = Arc::new(Access {
-        streams: Arc::new(Semaphore::new(host.config.limits.channel_capacity.min(128))),
+        streams: Arc::new(Semaphore::new(
+            host.config().limits.channel_capacity.min(128),
+        )),
         host,
-        store,
         token,
         address,
         stop: CancellationToken::new(),
@@ -109,7 +105,7 @@ async fn handle(
     let permitted_origin = origin.as_ref().and_then(|v| v.to_str().ok()).filter(|s| {
         access
             .host
-            .config
+            .config()
             .http
             .allowed_origins
             .iter()
@@ -174,7 +170,7 @@ fn authorize(request: &Request<Incoming>, access: &Access) -> Result<()> {
             .map_err(|_| Error::new(403, "invalid_origin", "Origin is not allowed"))?;
         if !access
             .host
-            .config
+            .config()
             .http
             .allowed_origins
             .iter()
@@ -261,21 +257,23 @@ async fn route(mut request: Request<Incoming>, access: Arc<Access>) -> Result<Ht
     match (method.as_str(), segments.as_slice()) {
         ("GET", ["health"]) => Ok(json_response(200, host.health().await)),
         ("GET", ["configuration"]) => {
-            let store = access.store.clone();
-            let config = tokio::task::spawn_blocking(move || store.read())
-                .await
-                .map_err(|_| Error::storage())??;
+            let config = host.saved_configuration().await?;
             Ok(json_response(200, json!(config)))
         }
+        ("GET", ["configuration", "active"]) => Ok(json_response(200, json!(host.config()))),
         ("PUT", ["configuration"]) => {
             let config: HostConfig = json_body(&mut request).await?;
-            let store = access.store.clone();
-            tokio::task::spawn_blocking(move || store.save(&config))
-                .await
-                .map_err(|_| Error::storage())??;
+            host.update_configuration(config).await?;
             Ok(json_response(
                 200,
-                json!({"saved":true,"restart_required":true}),
+                json!({"saved":true,"applied":true,"restart_required":false}),
+            ))
+        }
+        ("POST", ["configuration", "reload"]) => {
+            host.reload_configuration().await?;
+            Ok(json_response(
+                200,
+                json!({"applied":true,"restart_required":false}),
             ))
         }
         ("GET", ["sessions"]) => Ok(json_response(

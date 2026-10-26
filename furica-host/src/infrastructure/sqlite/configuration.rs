@@ -9,6 +9,15 @@ pub struct ConfigStore {
 }
 
 impl ConfigStore {
+    /// Bind an already initialized database; Host owns the matching runtime resources.
+    pub(crate) fn at(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub(crate) fn directory(&self) -> &Path {
+        self.path.parent().unwrap_or_else(|| Path::new("."))
+    }
+
     pub fn open(
         path: impl AsRef<Path>,
         initial: Option<&HostConfig>,
