@@ -1,0 +1,23 @@
+%% furica-host 总体流程
+%% 对应目录：furica-host/
+%% 依据：furica-host/src/bootstrap/mod.rs; furica-host/src/facade/http/mod.rs; furica-host/src/facade/application/interaction.rs; furica-host/src/facade/application/delivery.rs; furica-host/src/facade/application/configuration.rs; furica-host/src/facade/application/lifecycle.rs
+%% 相关流程：configuration-flow.mmd
+flowchart TD
+    startup["准备数据目录并读取初始化或已保存配置"] --> validate["校验启用能力的参数、凭证与提示词"]
+    validate --> components["装配模型、语音与 Agent 能力"]
+    components --> serve["接收本机 Shell 请求并检查访问权限"]
+    serve --> kind{"请求职责"}
+    kind -->|"会话管理与查询"| records["管理长期业务会话并查询保存记录"]
+    kind -->|"文字或语音交互"| select["选择业务会话并建立 Core 交互"]
+    select --> core["提交输入与控制，接收 Core 结果"]
+    core --> output["向 Shell 提供事件、音频与状态"]
+    output --> feedback["接收 Shell 的后续输入与实际播放反馈"]
+    feedback --> core
+    core --> delivery["接收有序业务记录"]
+    delivery --> persist["事务保存完整记录与接收凭据"]
+    persist --> acknowledge["确认对应记录，使准备执行可以启动"]
+    acknowledge --> core
+    kind -->|"配置更新或重载"| candidate["先构建候选能力，再停止旧工作并保存记录"]
+    candidate --> publish["成功后发布新实例并恢复接入"]
+    publish --> serve
+    shutdown["收到退出请求"] --> cleanup["停止接入、清理执行并保存剩余记录"]

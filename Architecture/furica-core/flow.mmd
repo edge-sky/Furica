@@ -1,0 +1,21 @@
+%% furica-core 总体流程
+%% 对应目录：furica-core/
+%% 依据：furica-core/src/lib.rs; furica-core/src/orchestration/application/cascade/inference.rs; furica-core/src/orchestration/application/cascade/worker.rs; furica-core/src/orchestration/application/cascade/speech.rs; furica-core/src/sessions/application/manager.rs
+%% Host 提供能力、参数与业务会话数据；Core 不直接访问存储或供应商协议。
+flowchart TD
+    host["Host 注入能力、参数与会话数据"] --> session["建立或恢复长期业务会话"]
+    session --> input["接收文字、语音或执行反馈"]
+    input --> normalize["按需识别语音，形成有效输入"]
+    normalize --> context["记录输入并准备主模型上下文"]
+    context --> model["调用文本模型并校验结果"]
+    model --> result{"结果类型"}
+    result -->|"文字、拒绝或截断"| display["向 Host 提供可展示内容"]
+    result -->|"完整工具批次"| tools["调用 Core 工具并记录结果"]
+    tools -->|"整批结果回填"| context
+    tools -->|"准备 ACP 执行"| receipt["等待 Host 保存记录并确认"]
+    receipt --> execute["调度 Agent 执行与问题处理"]
+    execute -->|"执行终态或待回答问题"| input
+    tools -->|"speak 请求"| speech["排队合成完整音频并交付播放"]
+    speech --> playback["接收实际播放反馈后处理后续语音"]
+    session --> changes["业务记录变更交给 Host 保存并确认"]
+    cancel["打断或结束当前交互"] --> stop["取消当前回复与播放，保留业务历史"]

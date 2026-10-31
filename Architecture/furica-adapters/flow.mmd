@@ -1,0 +1,25 @@
+---
+config:
+  theme: neo-dark
+---
+%% furica-adapters 总体流程
+%% 对应目录：furica-adapters/
+%% 依据：furica-adapters/src/lib.rs; furica-adapters/src/text_model/mod.rs; furica-adapters/src/aliyun/mod.rs; furica-adapters/src/volcengine/mod.rs; furica-adapters/src/acp/infrastructure/connection.rs; furica-adapters/src/acp/infrastructure/session.rs
+%% 适配器承担协议转换与外部资源管理；会话规则、工具决策与持久化由上层负责。
+flowchart TD
+    host["Host 按配置构建并注入适配器"] --> invoke["Core 通过能力端口发起调用"]
+    invoke --> kind{"能力类型"}
+    kind -->|"文本生成"| model["选择既定文本协议并转换请求与续接材料"]
+    kind -->|"语音识别或合成"| speech["转换云端语音请求与音频"]
+    kind -->|"ACP 执行"| acp["取得 Agent 连接并建立或复用执行上下文"]
+    model --> external["访问外部服务或 Agent"]
+    speech --> external
+    acp --> external
+    external --> result{"外部反馈"}
+    result -->|"模型或语音结果"| normalize["转换为 Core 模型事件、最终文字或音频流"]
+    result -->|"Agent 进度、问题或终态"| events["转换为 Core 执行事件"]
+    events -->|"需要回答"| answer["将 Core 的答案传回原 Agent 请求"]
+    answer --> external
+    normalize --> core["交回 Core 校验并决定后续业务流程"]
+    events --> core
+    result -->|"失败或取消"| cleanup["释放所持资源并报告错误或执行终态"]

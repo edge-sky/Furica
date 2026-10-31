@@ -1,0 +1,20 @@
+%% furica-local 总体流程
+%% 对应目录：furica-local/
+%% 依据：furica-local/src/lib.rs; furica-local/src/vad/infrastructure/model.rs; furica-local/src/vad/domain/trigger.rs; furica-local/src/asr/infrastructure/mod.rs
+%% VAD 与可选 ASR 是独立能力；音频采集、格式转换、缓存与语音段组合由调用方负责。
+flowchart TD
+    caller["Host 或独立调用方提供本地模型文件"] --> load["加载并检查所选本地语音能力"]
+    load --> kind{"调用能力"}
+    kind -->|"VAD"| frames["接收调用方准备好的连续音频帧"]
+    frames --> detect["推理语音概率并应用边界确认规则"]
+    detect --> boundary["返回概率与可选语音开始、结束事件"]
+    boundary --> collect["调用方继续输入或组合完整语音段"]
+    collect -->|"继续检测"| frames
+    collect -->|"选择本地识别"| utterance
+    kind -->|"可选 ASR"| utterance["接收并检查完整语音段"]
+    utterance --> available{"本地推理能力可用"}
+    available -->|"否"| busy["返回忙碌，由调用方安排后续处理"]
+    available -->|"是"| recognize["准备语音特征并执行本地识别"]
+    recognize --> text["将识别结果转换为最终文字"]
+    text --> result["返回调用方并释放本次推理占用"]
+    cancel["取消或执行失败"] --> stop["停止当前处理并报告结果，必要时重置"]
